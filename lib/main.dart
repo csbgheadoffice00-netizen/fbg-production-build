@@ -3,36 +3,15 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:async';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  
-  int? savedUserId;
-  String? savedEmail;
-
-  // Safety try-catch to prevent crash if storage is blocked
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    savedUserId = prefs.getInt('user_id');
-    savedEmail = prefs.getString('user_email');
-  } catch (e) {
-    print("Storage blocked on startup: $e");
-  }
-
-  runApp(MyApp(
-    initialUserId: savedUserId,
-    initialEmail: savedEmail,
-  ));
+void main() {
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  final int? initialUserId;
-  final String? initialEmail;
-
-  const MyApp({super.key, this.initialUserId, this.initialEmail});
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -107,10 +86,7 @@ class MyApp extends StatelessWidget {
           surface: darkCard,
         ),
       ),
-      // Auto-login if session exists
-      home: initialUserId != null && initialEmail != null
-          ? HomeScreen(userId: initialUserId!, email: initialEmail!)
-          : const LoginScreen(),
+      home: const LoginScreen(),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -195,20 +171,11 @@ class _LoginScreenState extends State<LoginScreen> {
         url,
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"email": email, "password": password, "referral_code": referral}),
-      ).timeout(const Duration(seconds: 45)); // <-- ADDED TIMEOUT
+      ).timeout(const Duration(seconds: 45));
       
       final data = jsonDecode(response.body);
       
       if (response.statusCode == 200) {
-        // SAVE SESSION
-        try {
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setInt('user_id', data['user_id']);
-          await prefs.setString('user_email', data['email']);
-        } catch (e) {
-          print("Could not save session: $e");
-        }
-
         if (isRegister) {
           await http.post(
             Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/request-code'),
@@ -1319,7 +1286,7 @@ class ProfileTab extends StatelessWidget {
         Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-invoice'),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"user_id": appState.userId, "amount": amount}),
-      ).timeout(const Duration(seconds: 45)); // <-- ADDED TIMEOUT
+      ).timeout(const Duration(seconds: 45));
       
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
@@ -1506,9 +1473,7 @@ class ProfileTab extends StatelessWidget {
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
-                  onPressed: () async {
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.clear();
+                  onPressed: () {
                     Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
                   },
                   icon: const Icon(Icons.logout, color: Colors.red),
