@@ -13,14 +13,13 @@ void main() async {
   int? savedUserId;
   String? savedEmail;
 
-  // Safety try-catch for Huawei/HarmonyOS
+  // Safety try-catch to prevent crash if storage is blocked
   try {
     final prefs = await SharedPreferences.getInstance();
     savedUserId = prefs.getInt('user_id');
     savedEmail = prefs.getString('user_email');
   } catch (e) {
-    // If Huawei blocks the storage, we just ignore it and show the login screen
-    print("Storage blocked: $e");
+    print("Storage blocked on startup: $e");
   }
 
   runApp(MyApp(
@@ -196,7 +195,7 @@ class _LoginScreenState extends State<LoginScreen> {
         url,
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"email": email, "password": password, "referral_code": referral}),
-      );
+      ).timeout(const Duration(seconds: 45)); // <-- ADDED TIMEOUT
       
       final data = jsonDecode(response.body);
       
@@ -1320,7 +1319,8 @@ class ProfileTab extends StatelessWidget {
         Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-invoice'),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"user_id": appState.userId, "amount": amount}),
-      );
+      ).timeout(const Duration(seconds: 45)); // <-- ADDED TIMEOUT
+      
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final url = Uri.parse(data['invoice_url']);
