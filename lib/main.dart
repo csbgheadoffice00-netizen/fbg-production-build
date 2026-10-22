@@ -134,8 +134,8 @@ class MyApp extends StatelessWidget {
 }
 
 // ============== SERVICE ICON MAPPER ==============
-IconData getServiceIcon(String code) {
-  final Map<String, IconData> map = {
+FaIconData getServiceIcon(String code) {
+  final Map<String, FaIconData> map = {
     "wa": FontAwesomeIcons.whatsapp, "tg": FontAwesomeIcons.telegram,
     "fb": FontAwesomeIcons.facebookF, "ig": FontAwesomeIcons.instagram,
     "lf": FontAwesomeIcons.tiktok, "tw": FontAwesomeIcons.xTwitter,
