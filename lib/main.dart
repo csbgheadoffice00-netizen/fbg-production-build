@@ -1291,7 +1291,7 @@ class ProfileTab extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            const Text("For payments under $20, please use USDT (TRC20) or Litecoin (LTC) on the checkout page to avoid high Bitcoin fees.", style: TextStyle(fontSize: 12, color: Colors.orange)),
+            const Text("For payments under /$20, please use USDT (TRC20) or Litecoin (LTC) on the checkout page to avoid high Bitcoin fees.", style: TextStyle(fontSize: 12, color: Colors.orange)),
           ],
         ),
         actions: [
