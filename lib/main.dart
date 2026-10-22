@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -1271,6 +1272,7 @@ class ProfileTab extends StatelessWidget {
   final MainAppState appState;
   const ProfileTab({super.key, required this.appState});
 
+  // ---- Amount dialog: now returns the amount only ----
   Future<void> _showTopUpDialog(BuildContext context) async {
     final controller = TextEditingController(text: "5");
     final amount = await showDialog<double>(
@@ -1281,55 +1283,133 @@ class ProfileTab extends StatelessWidget {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text("Enter amount in USD (min \$1.00):"),
-            const SizedBox(height: 10),
             TextField(
               controller: controller,
-              keyboardType: TextInputType.number,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
               decoration: const InputDecoration(
+                labelText: "Amount (USD)",
                 prefixText: "\$ ",
               ),
             ),
             const SizedBox(height: 10),
-            const Text("For payments under USD 20, please use USDT (TRC20) or Litecoin (LTC) on the checkout page to avoid high Bitcoin fees.", style: TextStyle(fontSize: 12, color: Colors.orange)),
+            const Text(
+              "For payments under USD 20, please use USDT (TRC20) or Litecoin (LTC) on the checkout page to avoid high Bitcoin fees.",
+              style: TextStyle(fontSize: 12, color: Colors.orange),
+            ),
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel", style: TextStyle(color: Colors.grey))),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
+          ),
           ElevatedButton(
             onPressed: () {
               final val = double.tryParse(controller.text);
               if (val != null && val >= 1.0) {
                 Navigator.pop(context, val);
               } else {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Minimum is \$1.00"), backgroundColor: Colors.red));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text("Minimum is \$1.00"), backgroundColor: Colors.red),
+                );
               }
             },
-            child: const Text("Pay"),
+            child: const Text("Continue"),
           ),
         ],
       ),
     );
 
     if (amount == null) return;
+    if (!context.mounted) return;
 
+    // After amount, show payment choice sheet
+    _showPaymentChoice(context, amount);
+  }
+
+  // ---- NEW: Payment choice bottom sheet ----
+  void _showPaymentChoice(BuildContext context, double amount) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                "Pay \$${amount.toStringAsFixed(2)} with",
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 16, color: Colors.white70),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                "Choose Payment Method",
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00FF41)),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _startNowPayments(context, amount);
+                },
+                icon: const Icon(Icons.currency_bitcoin),
+                label: const Text("Crypto (NOWPayments)"),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(0, 50),
+                  backgroundColor: Colors.orange,
+                  foregroundColor: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _startApirone(context, amount);
+                },
+                icon: const Icon(Icons.currency_bitcoin_outlined),
+                label: const Text("Bitcoin (Apirone)"),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(0, 50),
+                  backgroundColor: Colors.amber,
+                  foregroundColor: Colors.black,
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---- NOWPayments flow (your original code, moved here) ----
+  Future<void> _startNowPayments(BuildContext context, double amount) async {
     try {
       final res = await http.post(
         Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-invoice'),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({"user_id": appState.userId, "amount": amount}),
       ).timeout(const Duration(seconds: 45));
-      
+
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final url = Uri.parse(data['invoice_url']);
-        
-        // Try to launch the URL directly
+
         try {
           await launchUrl(url, mode: LaunchMode.externalApplication);
           Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
         } catch (e) {
-          // If it fails, show the link so the user can copy it
           if (context.mounted) {
             showDialog(
               context: context,
@@ -1352,14 +1432,109 @@ class ProfileTab extends StatelessWidget {
         }
       } else {
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Failed to create invoice"), backgroundColor: Colors.red));
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Failed to create invoice"), backgroundColor: Colors.red),
+          );
         }
       }
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red),
+        );
       }
     }
+  }
+
+  // ---- NEW: Apirone BTC flow ----
+  Future<void> _startApirone(BuildContext context, double amount) async {
+    try {
+      final res = await http.post(
+        Uri.parse('https://grizzly-sms-backend.onrender.com/api/apirone/create-invoice'),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({"user_id": appState.userId, "amount": amount}),
+      ).timeout(const Duration(seconds: 45));
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final invoiceUrl = data['invoice_url'] ?? data['payment_url'];
+        final btcAddress = data['address'];
+        final btcAmount = data['amount_btc'];
+
+        if (invoiceUrl != null) {
+          final url = Uri.parse(invoiceUrl);
+          try {
+            await launchUrl(url, mode: LaunchMode.externalApplication);
+            Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
+          } catch (e) {
+            if (context.mounted) _showLinkDialog(context, invoiceUrl);
+          }
+        } else if (btcAddress != null) {
+          if (context.mounted) {
+            showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                backgroundColor: const Color(0xFF1A1A1A),
+                title: const Text("Send Bitcoin", style: TextStyle(color: Color(0xFF00FF41))),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("Send exactly:", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                    const SizedBox(height: 4),
+                    SelectableText("${btcAmount ?? ''} BTC", style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold, fontSize: 16)),
+                    const SizedBox(height: 12),
+                    const Text("To this address:", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                    const SizedBox(height: 4),
+                    SelectableText(btcAddress, style: const TextStyle(color: Colors.white, fontSize: 13)),
+                    const SizedBox(height: 12),
+                    const Text("Your balance will update automatically after confirmation.", style: TextStyle(color: Colors.orange, fontSize: 11)),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text("Close", style: TextStyle(color: Colors.grey)),
+                  ),
+                ],
+              ),
+            );
+          }
+        }
+      } else {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Failed to create Bitcoin invoice"), backgroundColor: Colors.red),
+          );
+        }
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  void _showLinkDialog(BuildContext context, String link) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text("Payment Link", style: TextStyle(color: Color(0xFF00FF41))),
+        content: SelectableText(
+          "Please copy this link and open it in your browser to pay:\n\n$link",
+          style: const TextStyle(color: Colors.white),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Close", style: TextStyle(color: Colors.grey)),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1397,12 +1572,12 @@ class ProfileTab extends StatelessWidget {
                           Expanded(
                             child: ElevatedButton.icon(
                               onPressed: () => _showTopUpDialog(context),
-                              icon: const Icon(Icons.currency_bitcoin),
-                              label: const Text("Crypto"),
+                              icon: const Icon(Icons.currency_exchange),
+                              label: const Text("Add Funds"),
                               style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50), 
-                                backgroundColor: Colors.orange, 
-                                foregroundColor: Colors.white
+                                minimumSize: const Size(0, 50),
+                                backgroundColor: Colors.green,
+                                foregroundColor: Colors.black,
                               ),
                             ),
                           ),
@@ -1417,9 +1592,9 @@ class ProfileTab extends StatelessWidget {
                               icon: const Icon(Icons.credit_card),
                               label: const Text("Card"),
                               style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50), 
-                                backgroundColor: Colors.grey[800], 
-                                foregroundColor: Colors.white
+                                minimumSize: const Size(0, 50),
+                                backgroundColor: Colors.grey[800],
+                                foregroundColor: Colors.white,
                               ),
                             ),
                           ),
@@ -1664,32 +1839,4 @@ class _CountryPickerSheetState extends State<CountryPickerSheet> {
 
     return ListTile(
       enabled: !isOutOfStock,
-      title: Text(
-        name, 
-        style: TextStyle(
-          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal, 
-          color: isOutOfStock 
-              ? Colors.grey[600] 
-              : (isSelected ? const Color(0xFF00FF41) : Colors.white),
-        )
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isOutOfStock)
-            Text("Out of stock", style: TextStyle(color: Colors.red[300], fontSize: 12))
-          else
-            Text("\$${(price + 0.20).toStringAsFixed(2)}", style: const TextStyle(color: Color(0xFF00FF41), fontWeight: FontWeight.bold, fontSize: 13)),
-          
-          if (isSelected && !isOutOfStock)
-            const Padding(padding: EdgeInsets.only(left: 8), child: Icon(Icons.check, color: Color(0xFF00FF41), size: 20)),
-        ],
-      ),
-      selected: isSelected && !isOutOfStock,
-      onTap: isOutOfStock ? null : () {
-        widget.onSelected(id, name);
-        Navigator.pop(context);
-      },
-    );
-  }
-}
+     
