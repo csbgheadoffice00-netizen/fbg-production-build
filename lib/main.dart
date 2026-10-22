@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'dart:convert';
 import 'dart:async';
 
@@ -1290,13 +1289,7 @@ class ProfileTab extends StatelessWidget {
       
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
-        final url = Uri.parse(data['invoice_url']);
-        if (await canLaunchUrl(url)) {
-          await launchUrl(url, mode: LaunchMode.externalApplication);
-          Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Could not open payment page"), backgroundColor: Colors.red));
-        }
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Payment page link: ${data['invoice_url']}"), backgroundColor: Colors.green));
       } else {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Failed to create invoice"), backgroundColor: Colors.red));
       }
@@ -1455,15 +1448,8 @@ class ProfileTab extends StatelessWidget {
                       title: const Text("Contact Support", style: TextStyle(color: Colors.grey)),
                       subtitle: const Text("Chat with us on Telegram", style: TextStyle(color: Colors.white70, fontSize: 12)),
                       trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
-                      onTap: () async {
-                        final Uri telegramUrl = Uri.parse('https://t.me/FBG_Support');
-                        if (await canLaunchUrl(telegramUrl)) {
-                          await launchUrl(telegramUrl, mode: LaunchMode.externalApplication);
-                        } else {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text("Could not open Telegram."), backgroundColor: Colors.red),
-                          );
-                        }
+                      onTap: () {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Telegram link coming soon")));
                       },
                     ),
                   ],
