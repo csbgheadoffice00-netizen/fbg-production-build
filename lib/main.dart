@@ -1323,17 +1323,42 @@ class ProfileTab extends StatelessWidget {
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final url = Uri.parse(data['invoice_url']);
-        if (await canLaunchUrl(url)) {
+        
+        // Try to launch the URL directly
+        try {
           await launchUrl(url, mode: LaunchMode.externalApplication);
           Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
-        } else {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Could not open payment page"), backgroundColor: Colors.red));
+        } catch (e) {
+          // If it fails, show the link so the user can copy it
+          if (context.mounted) {
+            showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                backgroundColor: const Color(0xFF1A1A1A),
+                title: const Text("Payment Link", style: TextStyle(color: Color(0xFF00FF41))),
+                content: SelectableText(
+                  "Please copy this link and open it in your browser to pay:\n\n$url",
+                  style: const TextStyle(color: Colors.white),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text("Close", style: TextStyle(color: Colors.grey)),
+                  ),
+                ],
+              ),
+            );
+          }
         }
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Failed to create invoice"), backgroundColor: Colors.red));
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Failed to create invoice"), backgroundColor: Colors.red));
+        }
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red));
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red));
+      }
     }
   }
 
@@ -1489,12 +1514,14 @@ class ProfileTab extends StatelessWidget {
                       trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
                       onTap: () async {
                         final Uri telegramUrl = Uri.parse('https://t.me/FBG_Support');
-                        if (await canLaunchUrl(telegramUrl)) {
+                        try {
                           await launchUrl(telegramUrl, mode: LaunchMode.externalApplication);
-                        } else {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text("Could not open Telegram."), backgroundColor: Colors.red),
-                          );
+                        } catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text("Could not open Telegram."), backgroundColor: Colors.red),
+                            );
+                          }
                         }
                       },
                     ),
