@@ -1839,4 +1839,31 @@ class _CountryPickerSheetState extends State<CountryPickerSheet> {
 
     return ListTile(
       enabled: !isOutOfStock,
-     
+           title: Text(
+        name,
+        style: TextStyle(
+          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          color: isOutOfStock
+              ? Colors.grey[600]
+              : (isSelected ? const Color(0xFF00FF41) : Colors.white),
+        ),
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isOutOfStock)
+            Text("Out of stock", style: TextStyle(color: Colors.red[300], fontSize: 12))
+          else
+            Text("\$${(price + 0.20).toStringAsFixed(2)}", style: const TextStyle(color: Color(0xFF00FF41), fontWeight: FontWeight.bold, fontSize: 13)),
+          if (isSelected && !isOutOfStock)
+            const Padding(padding: EdgeInsets.only(left: 8), child: Icon(Icons.check, color: Color(0xFF00FF41), size: 20)),
+        ],
+      ),
+      selected: isSelected && !isOutOfStock,
+      onTap: isOutOfStock ? null : () {
+        widget.onSelected(id, name);
+        Navigator.pop(context);
+      },
+    );
+  }
+}
