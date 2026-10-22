@@ -277,17 +277,14 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          image: DecorationImage(
-            image: AssetImage('assets/icon.png'),
-            fit: BoxFit.cover,
-            opacity: 0.15,
-          ),
-        ),
+          // decoration: const BoxDecoration(
+        //   image: DecorationImage(
+        //     image: AssetImage('assets/icon.png'),
+        //     fit: BoxFit.cover,
+        //     opacity: 0.15,
+        //   ),
+        // ),
+        color: const Color(0xFF0F0F0F), // Just a solid dark background
         child: Center(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(30.0),
