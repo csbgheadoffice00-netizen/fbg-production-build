@@ -1,12 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Required for internet access -->
     <uses-permission android:name="android.permission.INTERNET"/>
-
+    
     <application
         android:label="FBG SMS"
         android:name="${applicationName}"
-        android:icon="@mipmap/launcher_icon"
-        android:usesCleartextTraffic="true">
+        android:icon="@mipmap/ic_launcher">
         
         <activity
             android:name=".MainActivity"
