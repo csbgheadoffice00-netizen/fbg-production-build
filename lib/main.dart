@@ -1491,11 +1491,11 @@ class ProfileTab extends StatelessWidget {
           final decoded = jsonDecode(res.body);
           if (decoded is Map<String, dynamic>) data = decoded;
         } catch (_) {}
-        final invoiceUrl = data['invoice_url'] ?? data['payment_url'] ?? data['url'] ?? data['invoice_link'];
+        final invoiceUrl = data['invoice_url'] ?? data['invoice-url'] ?? data['payment_url'] ?? data['url'] ?? data['invoice_link'];
         final btcAddress = data['address'];
         final btcAmount = data['amount_btc'];
 
-        if (invoiceUrl != null) {
+        if (invoiceUrl != null && invoiceUrl.toString().isNotEmpty) {
           final url = Uri.parse(invoiceUrl.toString());
           bool opened = false;
           try {
@@ -1538,21 +1538,30 @@ class ProfileTab extends StatelessWidget {
               ),
             );
           }
+        } else {
+          if (context.mounted) _cryptoFallback(context, amount);
         }
       } else {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Bitcoin invoice failed (${res.statusCode}): ${res.body}"), backgroundColor: Colors.red),
-          );
-        }
+        // Apirone gateway is misconfigured or down: keep the user able to pay
+        // through the working NOWPayments crypto checkout instead of dead-ending.
+        if (context.mounted) _cryptoFallback(context, amount);
       }
     } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Payment error: ${e.toString().split('\n').first}"), backgroundColor: Colors.red),
-        );
-      }
+      if (context.mounted) _cryptoFallback(context, amount);
     }
+  }
+
+  Future<void> _cryptoFallback(BuildContext context, double amount) async {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Bitcoin gateway unavailable - opening crypto checkout instead"),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 4),
+        ),
+      );
+    }
+    await _startNowPayments(context, amount);
   }
 
   void _showLinkDialog(BuildContext context, String link) {
@@ -1901,4 +1910,4 @@ class _CountryPickerSheetState extends State<CountryPickerSheet> {
       },
     );
   }
-}
+}
