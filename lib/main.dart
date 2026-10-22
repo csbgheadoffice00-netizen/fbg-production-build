@@ -1353,7 +1353,7 @@ class ProfileTab extends StatelessWidget {
     if (!context.mounted) return;
 
     if (method == "crypto") {
-      _startApirone(context, amount);
+      _showPaymentChoice(context, amount);
     } else if (method == "card") {
       _startNowPayments(context, amount);
     } else {
@@ -1361,16 +1361,34 @@ class ProfileTab extends StatelessWidget {
     }
   }
 
+  // Coins enabled on the Apirone account. code | display name | symbol | brand colour
+  static const List<List<String>> _cryptoCoins = [
+    ["btc", "Bitcoin", "BTC", "0xFFF7931A"],
+    ["eth", "Ethereum", "ETH", "0xFF627EEA"],
+    ["usdt@trx", "Tether USDT (TRC20)", "USDT", "0xFF26A17B"],
+    ["usdc@trx", "USD Coin (TRC20)", "USDC", "0xFF2775CA"],
+    ["usdt@eth", "Tether USDT (ERC20)", "USDT", "0xFF26A17B"],
+    ["usdc@eth", "USD Coin (ERC20)", "USDC", "0xFF2775CA"],
+    ["usdt@bnb", "Tether USDT (BEP20)", "USDT", "0xFF26A17B"],
+    ["usdt@ton", "Tether USDT (TON)", "USDT", "0xFF0098EA"],
+    ["ltc", "Litecoin", "LTC", "0xFF345D9D"],
+    ["bch", "Bitcoin Cash", "BCH", "0xFF8DC351"],
+    ["doge", "Dogecoin", "DOGE", "0xFFC2A633"],
+    ["trx", "TRON", "TRX", "0xFFE50915"],
+    ["bnb", "BNB", "BNB", "0xFFF3BA2F"],
+  ];
+
   void _showPaymentChoice(BuildContext context, double amount) {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1A1A1A),
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) => SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1378,43 +1396,72 @@ class ProfileTab extends StatelessWidget {
               Text(
                 "Pay \$${amount.toStringAsFixed(2)} with",
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16, color: Colors.white70),
+                style: const TextStyle(fontSize: 15, color: Colors.white70),
               ),
-              const SizedBox(height: 6),
+              const SizedBox(height: 4),
               const Text(
                 "Choose Payment Method",
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00FF41)),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
               ElevatedButton.icon(
                 onPressed: () {
                   Navigator.pop(ctx);
                   _startNowPayments(context, amount);
                 },
-                icon: const Icon(Icons.currency_bitcoin),
-                label: const Text("Crypto (NOWPayments)"),
+                icon: const Icon(Icons.credit_card, size: 20),
+                label: const Text("Card / Crypto checkout (NOWPayments)"),
                 style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(0, 50),
+                  minimumSize: const Size(0, 48),
                   backgroundColor: Colors.orange,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 12),
-              ElevatedButton.icon(
-                onPressed: () {
-                  Navigator.pop(ctx);
-                  _startApirone(context, amount);
-                },
-                icon: const Icon(Icons.currency_bitcoin_outlined),
-                label: const Text("Bitcoin (Apirone)"),
-                style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(0, 50),
-                  backgroundColor: Colors.amber,
                   foregroundColor: Colors.black,
+                  textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 16),
+              const Row(
+                children: [
+                  Expanded(child: Divider(color: Colors.white24)),
+                  Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 10),
+                    child: Text("or pay with", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  ),
+                  Expanded(child: Divider(color: Colors.white24)),
+                ],
+              ),
+              const SizedBox(height: 4),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 300),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _cryptoCoins.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white12),
+                  itemBuilder: (c, i) {
+                    final coin = _cryptoCoins[i];
+                    final Color brand = Color(int.parse(coin[3]));
+                    return ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: CircleAvatar(
+                        radius: 14,
+                        backgroundColor: brand.withValues(alpha: 0.22),
+                        child: Text(
+                          coin[2].substring(0, 1),
+                          style: TextStyle(color: brand, fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      title: Text(coin[1], style: const TextStyle(color: Colors.white, fontSize: 14)),
+                      subtitle: Text(coin[2], style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                      trailing: const Icon(Icons.chevron_right, size: 18, color: Colors.grey),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _startApirone(context, amount, coin[0]);
+                      },
+                    );
+                  },
+                ),
+              ),
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
@@ -1477,12 +1524,12 @@ class ProfileTab extends StatelessWidget {
     }
   }
 
-  Future<void> _startApirone(BuildContext context, double amount) async {
+  Future<void> _startApirone(BuildContext context, double amount, String currency) async {
     try {
       final res = await http.post(
         Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-btc-invoice'),
         headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"user_id": appState.userId, "amount": amount}),
+        body: jsonEncode({"user_id": appState.userId, "amount": amount, "currency": currency}),
       ).timeout(const Duration(seconds: 90));
 
       if (res.statusCode == 200) {
