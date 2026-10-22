@@ -277,85 +277,80 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
-          // decoration: const BoxDecoration(
-        //   image: DecorationImage(
-        //     image: AssetImage('assets/icon.png'),
-        //     fit: BoxFit.cover,
-        //     opacity: 0.15,
-        //   ),
-        // ),
-        color: const Color(0xFF0F0F0F), // Just a solid dark background
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(30.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.sms, size: 80, color: Color(0xFF00FF41)),
-                const SizedBox(height: 20),
-                const Text("FBG SMS", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Color(0xFF00FF41), letterSpacing: 2)),
-                const SizedBox(height: 40),
-                TextField(controller: _emailController, decoration: const InputDecoration(labelText: "Email", prefixIcon: Icon(Icons.email)), keyboardType: TextInputType.emailAddress),
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F0F0F),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(30.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.sms, size: 80, color: Color(0xFF00FF41)),
+              const SizedBox(height: 20),
+              const Text("FBG SMS", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Color(0xFF00FF41), letterSpacing: 2)),
+              const SizedBox(height: 40),
+              TextField(controller: _emailController, decoration: const InputDecoration(labelText: "Email", prefixIcon: Icon(Icons.email)), keyboardType: TextInputType.emailAddress),
+              const SizedBox(height: 15),
+              TextField(controller: _passwordController, decoration: const InputDecoration(labelText: "Password", prefixIcon: Icon(Icons.lock)), obscureText: true),
+              if (_showReferralField) ...[
                 const SizedBox(height: 15),
-                TextField(controller: _passwordController, decoration: const InputDecoration(labelText: "Password", prefixIcon: Icon(Icons.lock)), obscureText: true),
-                if (_showReferralField) ...[
-                  const SizedBox(height: 15),
-                  TextField(
-                    controller: _referralController,
-                    decoration: const InputDecoration(
-                      labelText: "Referral Code",
-                      hintText: "FBG-XXXXXX",
-                      prefixIcon: Icon(Icons.card_giftcard, color: Colors.orange),
-                    ),
-                    textCapitalization: TextCapitalization.characters,
+                TextField(
+                  controller: _referralController,
+                  decoration: const InputDecoration(
+                    labelText: "Referral Code",
+                    hintText: "FBG-XXXXXX",
+                    prefixIcon: Icon(Icons.card_giftcard, color: Colors.orange),
                   ),
-                ],
+                  textCapitalization: TextCapitalization.characters,
+                ),
+              ],
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: _showForgotPassword,
+                  child: const Text("Forgot Password?", style: TextStyle(color: Colors.grey)),
+                ),
+              ),
+              if (_errorMessage.isNotEmpty) Text(_errorMessage, style: const TextStyle(color: Colors.red)),
+              const SizedBox(height: 10),
+              if (_isLoading) const CircularProgressIndicator(color: Color(0xFF00FF41)),
+              if (!_isLoading) ...[
+                ElevatedButton(onPressed: () => _submit(false), style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)), child: const Text("Login")),
                 const SizedBox(height: 10),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton(
-                    onPressed: _showForgotPassword,
-                    child: const Text("Forgot Password?", style: TextStyle(color: Colors.grey)),
+                if (!_showReferralField)
+                  OutlinedButton.icon(
+                    onPressed: () => _submit(true),
+                    icon: const Icon(Icons.person_add),
+                    label: const Text("Create Account"),
+                    style: OutlinedButton.styleFrom(minimumSize: const Size(250, 50)),
+                  )
+                else
+                  ElevatedButton.icon(
+                    onPressed: () => _submit(true, withReferral: true),
+                    icon: const Icon(Icons.card_giftcard),
+                    label: const Text("Create Account with Referral"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.orange,
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(250, 50),
+                    ),
+                  ),
+                const SizedBox(height: 10),
+                TextButton(
+                  onPressed: () => setState(() {
+                    _showReferralField = !_showReferralField;
+                    _errorMessage = "";
+                  }),
+                  child: Text(
+                    _showReferralField ? "Back to normal signup" : "Have a referral code? Tap here",
+                    style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.w600),
                   ),
                 ),
-                if (_errorMessage.isNotEmpty) Text(_errorMessage, style: const TextStyle(color: Colors.red)),
-                const SizedBox(height: 10),
-                if (_isLoading) const CircularProgressIndicator(color: Color(0xFF00FF41)),
-                if (!_isLoading) ...[
-                  ElevatedButton(onPressed: () => _submit(false), style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)), child: const Text("Login")),
-                  const SizedBox(height: 10),
-                  if (!_showReferralField)
-                    OutlinedButton.icon(
-                      onPressed: () => _submit(true),
-                      icon: const Icon(Icons.person_add),
-                      label: const Text("Create Account"),
-                      style: OutlinedButton.styleFrom(minimumSize: const Size(250, 50)),
-                    )
-                  else
-                    ElevatedButton.icon(
-                      onPressed: () => _submit(true, withReferral: true),
-                      icon: const Icon(Icons.card_giftcard),
-                      label: const Text("Create Account with Referral"),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orange,
-                        foregroundColor: Colors.white,
-                        minimumSize: const Size(250, 50),
-                      ),
-                    ),
-                  const SizedBox(height: 10),
-                  TextButton(
-                    onPressed: () => setState(() {
-                      _showReferralField = !_showReferralField;
-                      _errorMessage = "";
-                    }),
-                    child: Text(
-                      _showReferralField ? "Back to normal signup" : "Have a referral code? Tap here",
-                      style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                ],
               ],
-            ),
+            ],
           ),
         ),
       ),
