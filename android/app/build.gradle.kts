@@ -15,7 +15,7 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    applicationId = "com.fbgsms.app"
+    namespace = "com.fbgsms.app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -26,7 +26,7 @@ android {
 
     defaultConfig {
         applicationId = "com.fbgsms.app"
-        minSdk = flutter.minSdkVersion
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -34,8 +34,6 @@ android {
 
     signingConfigs {
         create("release") {
-            // This block safely loads the keystore if it exists.
-            // If the file is missing, it won't crash the build.
             if (keystorePropertiesFile.exists()) {
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
@@ -47,8 +45,6 @@ android {
 
     buildTypes {
         release {
-            // Use the release signing config only if the keystore exists.
-            // Otherwise, fallback to the debug one to prevent crash (for testing).
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
             } else {
