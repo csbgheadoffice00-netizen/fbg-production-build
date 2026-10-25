@@ -10,8 +10,16 @@ import 'dart:async';
 
 const String kApiBase = 'https://grizzly-sms-backend.onrender.com';
 
-/// Root navigator. Used to send the user back to Login when the server
-/// rejects our token (tokens expire after 7 days).
+DateTime parseServerUtc(dynamic raw) {
+  final s = (raw ?? '').toString().trim();
+  if (s.isEmpty || s == 'null') return DateTime.now();
+  var v = s.replaceFirst(' ', 'T');
+  final hasZone = v.endsWith('Z') || RegExp(r'[+-]\d{2}:?\d{2}$').hasMatch(v);
+  if (!hasZone) v = '${v}Z';
+  final parsed = DateTime.tryParse(v);
+  return parsed == null ? DateTime.now() : parsed.toLocal();
+}
+
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 // ============== CUSTOMER-FACING MESSAGE FILTER ==============
@@ -1255,11 +1263,11 @@ class MainAppState extends ChangeNotifier {
               raw > 100000000000 ? raw.toInt() : (raw * 1000).toInt(),
               isUtc: true);
         } else {
-          ts = DateTime.tryParse(raw.toString());
+          ts = parseServerUtc(raw);
         }
         if (ts == null) continue;
         final left = 420 - DateTime.now().toUtc().difference(ts.toUtc()).inSeconds;
-        return left;
+return left.clamp(0, 420);
       } catch (_) {}
     }
     return 420;
@@ -2386,6 +2394,137 @@ class ProfileTab extends StatelessWidget {
     }
   }
 
+  Future<void> _showPaystackTopUpDialog(BuildContext context) async {
+    final controller = TextEditingController(text: "1000");
+    final amountNgn = await showDialog<int>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text("Paystack Top-Up", style: TextStyle(color: Color(0xFF00FF41))),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("Enter amount in Naira (NGN). Minimum 500:"),
+            const SizedBox(height: 10),
+            TextField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                prefixText: "₦ ",
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel", style: TextStyle(color: Colors.grey))),
+          ElevatedButton(
+            onPressed: () {
+              final val = int.tryParse(controller.text);
+              if (val != null && val >= 500) {
+                Navigator.pop(context, val);
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Minimum is ₦500"), backgroundColor: Colors.red));
+              }
+            },
+            child: const Text("Continue"),
+          ),
+        ],
+      ),
+    );
+
+    if (amountNgn != null && context.mounted) {
+      _startPaystack(context, amountNgn);
+    }
+  }
+
+  Future<void> _startPaystack(BuildContext context, int amountNgn) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => const Center(child: CircularProgressIndicator(color: Color(0xFF00FF41))),
+    );
+
+    try {
+      final res = await http.post(
+        Uri.parse('$kApiBase/api/paystack/initialize'),
+        headers: ApiAuth.headers({"Content-Type": "application/json"}),
+        body: jsonEncode({'amount_ngn': amountNgn}),
+      ).timeout(const Duration(seconds: 30));
+
+      if (!context.mounted) return;
+      Navigator.pop(context); // remove loading
+
+      if (res.statusCode != 200) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Failed to initialize payment (${res.statusCode})."), backgroundColor: Colors.red),
+        );
+        return;
+      }
+
+      final data = jsonDecode(res.body);
+      final ref = data['reference'];
+      final authUrl = data['authorization_url'];
+
+      await launchUrl(Uri.parse(authUrl), mode: LaunchMode.externalApplication);
+
+      if (context.mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => const AlertDialog(
+            backgroundColor: Color(0xFF1A1A1A),
+            content: Row(
+              children: [
+                CircularProgressIndicator(color: Color(0xFF00FF41)),
+                SizedBox(width: 20),
+                Expanded(child: Text("Waiting for payment confirmation...", style: TextStyle(color: Colors.white))),
+              ],
+            ),
+          ),
+        );
+      }
+
+      bool success = false;
+      for (var i = 0; i < 40; i++) {
+        await Future.delayed(const Duration(seconds: 3));
+        final check = await http.get(
+          Uri.parse('$kApiBase/api/paystack/verify/$ref'),
+          headers: ApiAuth.headers(),
+        );
+        if (jsonDecode(check.body)['status'] == 'finished') {
+          success = true;
+          break;
+        }
+      }
+
+      if (context.mounted) {
+        Navigator.pop(context); // Close polling dialog
+      }
+
+      if (success) {
+        await appState.refreshBalance();
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Payment successful! Balance updated."), backgroundColor: Colors.green),
+          );
+        }
+      } else {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Payment timed out. If you paid, it will reflect shortly."), backgroundColor: Colors.orange),
+          );
+        }
+      }
+    } catch (e) {
+      if (context.mounted) {
+        if (Navigator.canPop(context)) Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Payment error: ${e.toString().split('\n').first}"), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
   // Coins enabled on the Apirone account. code | display name | symbol | brand colour
   static const List<List<String>> _cryptoCoins = [
     ["btc", "Bitcoin", "BTC", "0xFFF7931A"],
@@ -2714,6 +2853,20 @@ class ProfileTab extends StatelessWidget {
                             ),
                           ),
                         ],
+                      ),
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: () => _showPaystackTopUpDialog(context),
+                          icon: const Icon(Icons.account_balance_wallet),
+                          label: const Text("Paystack (NGN)"),
+                          style: ElevatedButton.styleFrom(
+                            minimumSize: const Size(0, 50),
+                            backgroundColor: const Color(0xFF00C3F7), // Paystack brand color
+                            foregroundColor: Colors.white,
+                          ),
+                        ),
                       ),
                     ],
                   ),

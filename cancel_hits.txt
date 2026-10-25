@@ -1,0 +1,19 @@
+1155:    countdownTimer?.cancel();
+1156:    pollingTimer?.cancel();
+1157:    timeoutTimer?.cancel();
+1295:        timer.cancel();
+1303:        timer.cancel();
+1431:  Future<void> cancelActivation(ActiveNumber active) async {
+1438:            .post(Uri.parse('$kApiBase/api/cancel/${active.activationId}'),
+1462:            .post(Uri.parse('$kApiBase/api/cancel/${active.activationId}'),
+1956:    if (status == "CANCELLED") return Icons.cancel;
+2112:    if (ok == true) await appState.cancelActivation(active);
+2304:                      icon: const Icon(Icons.cancel, size: 18),
+110:      await prefs.remove('user_id');
+111:      await prefs.remove('user_email');
+1244:    for (final key in ['seconds_left', 'expires_in', 'time_left', 'ttl']) {
+1261:        final left = 420 - DateTime.now().toUtc().difference(ts.toUtc()).inSeconds;
+1446:    activeNumbers.remove(active);
+1475:    activeNumbers.remove(active);
+2826:                    await ApiAuth.clear();
+2828:                    await prefs.clear();
