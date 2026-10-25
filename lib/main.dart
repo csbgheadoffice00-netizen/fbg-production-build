@@ -1562,39 +1562,51 @@ class ProfileTab extends StatelessWidget {
                       const SizedBox(height: 10),
                       Text("\$${appState.balance.toStringAsFixed(2)}", style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Color(0xFF00FF41))),
                       const SizedBox(height: 15),
-                      Row(
+                      
+                      // --- CLEAN BUTTON UI ---
+                      Column(
                         children: [
-                          Expanded(
-                            child: ElevatedButton.icon(
-                              onPressed: () => _showTopUpDialog(context),
-                              icon: const Icon(Icons.currency_exchange),
-                              label: const Text("Add Funds"),
-                              style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50),
-                                backgroundColor: Colors.green,
-                                foregroundColor: Colors.black,
-                              ),
+                          // 1. CRYPTO BUTTON (Working)
+                          ElevatedButton.icon(
+                            onPressed: () => _showTopUpDialog(context),
+                            icon: const Icon(Icons.currency_bitcoin),
+                            label: const Text("Crypto"),
+                            style: ElevatedButton.styleFrom(
+                              minimumSize: const Size(double.infinity, 50),
+                              backgroundColor: Colors.orange,
+                              foregroundColor: Colors.white,
                             ),
                           ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: ElevatedButton.icon(
-                              onPressed: kPaystackEnabled ? () {
-                                // Paystack function will go here when live
-                              } : null,
-                              icon: const Icon(Icons.credit_card),
-                              label: const Text("Card (Soon)"),
-                              style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50), 
-                                disabledBackgroundColor: Colors.grey[900],
-                                disabledForegroundColor: Colors.grey[600],
-                                backgroundColor: Colors.blue,
-                                foregroundColor: Colors.white,
-                              ),
+                          const SizedBox(height: 10),
+                          
+                          // 2. CARD BUTTON (Disabled)
+                          ElevatedButton.icon(
+                            onPressed: null, 
+                            icon: const Icon(Icons.credit_card),
+                            label: const Text("Card (Soon)"),
+                            style: ElevatedButton.styleFrom(
+                              minimumSize: const Size(double.infinity, 50), 
+                              disabledBackgroundColor: Colors.grey[900],
+                              disabledForegroundColor: Colors.grey[600],
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+
+                          // 3. PAYSTACK BUTTON (Disabled)
+                          ElevatedButton.icon(
+                            onPressed: null, 
+                            icon: const Icon(Icons.account_balance_wallet),
+                            label: const Text("Paystack (Soon)"),
+                            style: ElevatedButton.styleFrom(
+                              minimumSize: const Size(double.infinity, 50), 
+                              disabledBackgroundColor: Colors.grey[900],
+                              disabledForegroundColor: Colors.grey[600],
                             ),
                           ),
                         ],
                       ),
+                      // -----------------------
+                      
                     ],
                   ),
                 ),
