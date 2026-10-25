@@ -1,2986 +1,1495 @@
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-import 'package:font_awesome_flutter/font_awesome_flutter.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'api_auth.dart';
-import 'dart:convert';
-import 'dart:async';
+import os
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+import psycopg2
+import hashlib
+import random
+import string
+import hmac
+import json
+from decimal import Decimal, ROUND_HALF_UP
+import resend
+import time
+import base64
+import secrets
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-const String kApiBase = 'https://grizzly-sms-backend.onrender.com';
+app = FastAPI()
 
-/// Root navigator. Used to send the user back to Login when the server
-/// rejects our token (tokens expire after 7 days).
-final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
+# ==================== SECURITY GATES (self-contained) ====================
+import hmac as _hmac
+import logging as _logging
+from starlette.middleware.base import BaseHTTPMiddleware as _BaseMW
+from starlette.responses import JSONResponse as _JSON
 
-// ============== CUSTOMER-FACING MESSAGE FILTER ==============
-// The backend relays raw text from the upstream SMS supplier. Those messages
-// must never reach a customer: they expose the supplier's brand and use wording
-// that makes no sense in the FBGSMS app. Every server message shown in the UI
-// is passed through fbgClean() so it always reads as FBGSMS.
-const List<String> _kUpstreamBrands = [
-  'herosms', 'hero-sms', 'hero sms', 'sms-activate', 'smsactivate', '5sim',
-  'smspool', 'sms-man', 'smsman', 'textverified', 'getsmscode', 'smshub',
-  'vaksms', 'grizzlysms', 'grizzly sms', 'onlinesim', 'online-sim',
-  'smspva', 'nonvoip', 'tiger-sms', 'tigersms', 'sms-acktiwator',
-];
+_log = _logging.getLogger("security_gate")
 
-String fbgClean(dynamic raw,
-    {String fallback = 'Something went wrong. Please try again.'}) {
-  var text = (raw ?? '').toString().trim();
-  if (text.isEmpty) return fallback;
-  // FastAPI validation payloads (lists / objects) are not customer copy.
-  if (text.startsWith('[') || text.startsWith('{')) return fallback;
+_ADMIN_PREFIX = "/api/admin"
 
-  var lower = text.toLowerCase();
-  if (lower.contains('insufficient_balance') ||
-      lower.contains('insufficient balance')) {
-    return 'Not enough balance. Top up or refer a friend to earn \$0.50!';
-  }
-  if (lower.contains('activation not found') ||
-      lower.contains('not_found') ||
-      lower.contains('user not found')) {
-    return 'That number session is no longer active. Please buy a new number.';
-  }
-  if (lower.contains('did not have this in stock') ||
-      lower.contains('out of stock') ||
-      lower.contains('no numbers') ||
-      lower.contains('no_numbers') ||
-      lower.contains('not have this') ||
-      lower.contains('no free phones')) {
-    return 'FBGSMS does not have this number in stock right now. '
-        'Please choose another country or service.';
-  }
+class AdminGate(_BaseMW):
+    async def dispatch(self, request, call_next):
+        path = request.url.path.rstrip("/")
+        if not (path == _ADMIN_PREFIX or path.startswith(_ADMIN_PREFIX + "/")):
+            return await call_next(request)
 
-  // Strip any supplier branding that survived the checks above.
-  for (final brand in _kUpstreamBrands) {
-    text = text.replaceAll(
-        RegExp(RegExp.escape(brand), caseSensitive: false), 'FBGSMS');
-  }
-  text = text.replaceAll(RegExp(r'\bhero\b', caseSensitive: false), 'FBGSMS');
-  text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
-  lower = text.toLowerCase();
-  if (lower.contains('did not have this in stock') ||
-      lower.contains('out of stock')) {
-    return 'FBGSMS does not have this number in stock right now. '
-        'Please choose another country or service.';
-  }
-  return text.isEmpty ? fallback : text;
-}
+        admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+        if not admin_key:
+            _log.warning("admin gate: ADMIN_API_KEY unset, denying %s", path)
+            return _JSON(
+                status_code=403,
+                content={"detail": "Admin access is disabled: no admin key configured."},
+            )
 
-/// Interpreted result of a single /api/check-sms poll.
-class SmsPollResult {
-  final String? code;
-  final String? fatalMessage;
-  const SmsPollResult({this.code, this.fatalMessage});
-  bool get isWaiting => code == null && fatalMessage == null;
-}
+        given = request.headers.get("x-admin-key", "")
+        if given and _hmac.compare_digest(given, admin_key):
+            return await call_next(request)
+        return _JSON(status_code=403, content={"detail": "Invalid or missing admin key."})
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+_DOCS_HIDDEN = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
-  // If any widget throws while building, show the error on screen instead of
-  // a blank window, so we can always see what went wrong.
-  ErrorWidget.builder = (FlutterErrorDetails details) {
-    return Material(
-      color: Colors.black,
-      child: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: Text(
-            'UI ERROR:\n\n${details.exceptionAsString()}',
-            style: const TextStyle(color: Colors.red, fontSize: 12),
-          ),
-        ),
-      ),
-    );
-  };
+class DocsGate(_BaseMW):
+    async def dispatch(self, request, call_next):
+        path = request.url.path.rstrip("/") or "/"
+        if path not in _DOCS_HIDDEN:
+            return await call_next(request)
+        if os.getenv("DOCS_ENABLED", "0") == "1":
+            return await call_next(request)
+        admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+        if admin_key:
+            given = request.headers.get("x-admin-key", "")
+            if given and _hmac.compare_digest(given, admin_key):
+                return await call_next(request)
+        return _JSON(status_code=404, content={"detail": "Not Found"})
 
-  
-  // Restore the login token before any screen can make a request. Without
-  // this, a restored session would call the API anonymously.
-  await ApiAuth.load();
+app.add_middleware(AdminGate)
+app.add_middleware(DocsGate)
+# ========================================================================
 
-  // A 401 means the token expired (7 days) or the account changed. Drop the
-  // saved session and return to Login instead of leaving a half-dead screen.
-  ApiAuth.onSessionExpired = () async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove('user_id');
-      await prefs.remove('user_email');
-    } catch (_) {}
-    final nav = appNavigatorKey.currentState;
-    if (nav == null) return;
-    nav.pushAndRemoveUntil(
-      MaterialPageRoute(
-        builder: (_) => const LoginScreen(
-          notice: "Your session expired. Please log in again.",
-        ),
-      ),
-      (route) => false,
-    );
-  };
+# --- CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  int? savedUserId;
-  String? savedEmail;
+# --- CONFIG ---
+API_KEY = os.getenv("API_KEY", "PASTE_YOUR_HERO_SMS_API_KEY_HERE")
+BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+PROFIT_MARGIN = 0.20
+REFERRAL_BONUS = 0.50
+STARTING_BALANCE = 0.00
+MAX_REFERRALS = 8
+FREE_REFERRAL_LIMIT = 3
 
-  // Auto-login logic
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    savedUserId = prefs.getInt('user_id');
-    savedEmail = prefs.getString('user_email');
-  } catch (e) {
-    print("Storage blocked on startup: $e");
-  }
+# --- Auth / token config (v2) ---
+AUTH_MODE = os.getenv("AUTH_MODE", "strict").strip().lower()
+AUTH_SECRET = os.getenv("AUTH_SECRET", "").strip()
+TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "168"))
+RESET_CODE_TTL_MINUTES = int(os.getenv("RESET_CODE_TTL_MINUTES", "15"))
+RESET_MAX_ATTEMPTS = int(os.getenv("RESET_MAX_ATTEMPTS", "5"))
+AUTH_GENERIC_RESPONSES = os.getenv("AUTH_GENERIC_RESPONSES", "1") == "1"
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "1") == "1"
+PBKDF2_ITERATIONS = int(os.getenv("PBKDF2_ITERATIONS", "260000"))
+MAX_PASSWORD_LENGTH = 200
 
-  // If we have a user id but no token, the session predates token auth.
-  // Force a fresh login instead of making unauthenticated calls.
-  if (savedUserId != null && !ApiAuth.isLoggedIn) {
-    savedUserId = null;
-    savedEmail = null;
-  }
+_EFFECTIVE_AUTH_SECRET = AUTH_SECRET or secrets.token_urlsafe(48)
+if not AUTH_SECRET:
+    _log.warning("AUTH_SECRET is not set - generated a random key at startup. Every token becomes invalid on the next restart. Set AUTH_SECRET on Render.")
+if AUTH_MODE not in ("compat", "strict"):
+    _log.warning("Unknown AUTH_MODE=%r - falling back to compat", AUTH_MODE)
+    AUTH_MODE = "compat"
 
-  runApp(MyApp(
-    initialUserId: savedUserId,
-    initialEmail: savedEmail,
-  ));
-}
+# NOWPayments Config
+NP_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
+NP_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 
-class MyApp extends StatelessWidget {
-  final int? initialUserId;
-  final String? initialEmail;
+# Paystack Config
+PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+NGN_PER_USD = float(os.getenv("NGN_PER_USD", "1500"))
 
-  const MyApp({super.key, this.initialUserId, this.initialEmail});
+# Apirone Config
+APIRONE_API_KEY = os.getenv("APIRONE_API_KEY", "PASTE_YOUR_APIRONE_KEY_HERE")
+APIRONE_ACCOUNT = os.getenv("APIRONE_ACCOUNT", "").strip()
+APIRONE_WEBHOOK_URL = os.getenv(
+    "APIRONE_WEBHOOK_URL",
+    "https://grizzly-sms-backend.onrender.com/api/payment/apirone-webhook",
+)
+APIRONE_REQUIRE_CONFIRMATION = os.getenv("APIRONE_REQUIRE_CONFIRMATION", "1") == "1"
 
-  @override
-  Widget build(BuildContext context) {
-    const Color neonGreen = Color(0xFF00FF41);
-    const Color darkBg = Color(0xFF0F0F0F);
-    const Color darkCard = Color(0xFF1A1A1A);
+# Resend Email Config
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+resend.api_key = RESEND_API_KEY
 
-    return MaterialApp(
-      navigatorKey: appNavigatorKey,
-      title: 'FBG SMS',
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        primaryColor: neonGreen,
-        scaffoldBackgroundColor: darkBg,
-        appBarTheme: const AppBarTheme(
-          backgroundColor: darkCard,
-          foregroundColor: neonGreen,
-          elevation: 0,
-        ),
-        cardColor: darkCard,
-        cardTheme: CardThemeData(
-          color: darkCard,
-          elevation: 8,
-          shadowColor: neonGreen.withValues(alpha: 0.2),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: BorderSide(color: neonGreen.withValues(alpha: 0.3), width: 1),
-          ),
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: neonGreen,
-            foregroundColor: Colors.black,
-            textStyle: const TextStyle(fontWeight: FontWeight.bold),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(
-            foregroundColor: neonGreen,
-            side: const BorderSide(color: neonGreen),
-          ),
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: darkCard,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: BorderSide(color: neonGreen.withValues(alpha: 0.5)),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: BorderSide(color: neonGreen.withValues(alpha: 0.3)),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: const BorderSide(color: neonGreen, width: 2),
-          ),
-          labelStyle: const TextStyle(color: Colors.grey),
-          prefixIconColor: neonGreen,
-        ),
-        bottomNavigationBarTheme: const BottomNavigationBarThemeData(
-          backgroundColor: darkCard,
-          selectedItemColor: neonGreen,
-          unselectedItemColor: Colors.grey,
-        ),
-        textTheme: const TextTheme(
-          bodyLarge: TextStyle(color: Colors.white),
-          bodyMedium: TextStyle(color: Colors.white70),
-        ),
-        colorScheme: const ColorScheme.dark(
-          primary: neonGreen,
-          secondary: neonGreen,
-          surface: darkCard,
-        ),
-      ),
-      home: initialUserId != null && initialEmail != null
-          ? HomeScreen(userId: initialUserId!, email: initialEmail!)
-          : const LoginScreen(),
-      debugShowCheckedModeBanner: false,
-    );
-  }
-}
+# ==================== DATABASE SETUP ====================
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
 
-// ============== SERVICE ICON MAPPER ==============
-// Every service in the catalogue gets a branded icon and colour. The lookup is
-// driven by the service name returned by the API (the short service code is not
-// reliable for this backend), with category fallbacks for regional brands.
-
-class ServiceLook {
-  final FaIconData icon;
-  final Color color;
-  const ServiceLook(this.icon, this.color);
-}
-
-class _BrandRule {
-  final List<String> keys;
-  final ServiceLook look;
-  const _BrandRule(this.keys, this.look);
-}
-
-const List<_BrandRule> _brandRules = <_BrandRule>[
-  _BrandRule(["whatsapp", "whats app", "whatsapp business"],
-      ServiceLook(FontAwesomeIcons.whatsapp, Color(0xFF25D366))), // WhatsApp
-  _BrandRule(["telegram"],
-      ServiceLook(FontAwesomeIcons.telegram, Color(0xFF229ED9))), // Telegram
-  _BrandRule(["facebook", "messenger"],
-      ServiceLook(FontAwesomeIcons.facebookF, Color(0xFF1877F2))), // Facebook
-  _BrandRule(["instagram", "insta", "threads"],
-      ServiceLook(FontAwesomeIcons.instagram, Color(0xFFE1306C))), // Instagram
-  _BrandRule(["tiktok", "douyin"],
-      ServiceLook(FontAwesomeIcons.tiktok, Color(0xFFFF0050))), // TikTok
-  _BrandRule(["twitter", "x com", "xtwitter"],
-      ServiceLook(FontAwesomeIcons.xTwitter, Color(0xFF1DA1F2))), // X / Twitter
-  _BrandRule(["discord"],
-      ServiceLook(FontAwesomeIcons.discord, Color(0xFF5865F2))), // Discord
-  _BrandRule(["snapchat"],
-      ServiceLook(FontAwesomeIcons.snapchat, Color(0xFFFFFC00))), // Snapchat
-  _BrandRule(["reddit"],
-      ServiceLook(FontAwesomeIcons.redditAlien, Color(0xFFFF4500))), // Reddit
-  _BrandRule(["pinterest"],
-      ServiceLook(FontAwesomeIcons.pinterest, Color(0xFFE60023))), // Pinterest
-  _BrandRule(["linkedin"],
-      ServiceLook(FontAwesomeIcons.linkedinIn, Color(0xFF0A66C2))), // LinkedIn
-  _BrandRule(["youtube"],
-      ServiceLook(FontAwesomeIcons.youtube, Color(0xFFFF0000))), // YouTube
-  _BrandRule(["twitch"],
-      ServiceLook(FontAwesomeIcons.twitch, Color(0xFF9146FF))), // Twitch
-  _BrandRule(["vk com", "=vk"],
-      ServiceLook(FontAwesomeIcons.vk, Color(0xFF0077FF))), // VK
-  _BrandRule(["ok ru", "odnoklassniki"],
-      ServiceLook(FontAwesomeIcons.odnoklassniki, Color(0xFFEE8208))), // OK.ru
-  _BrandRule(["wechat", "weixin"],
-      ServiceLook(FontAwesomeIcons.weixin, Color(0xFF07C160))), // WeChat
-  _BrandRule(["tencent qq", "=qq"],
-      ServiceLook(FontAwesomeIcons.qq, Color(0xFF12B7F5))), // QQ
-  _BrandRule(["weibo"],
-      ServiceLook(FontAwesomeIcons.weibo, Color(0xFFE6162D))), // Weibo
-  _BrandRule(["line messenger", "=line"],
-      ServiceLook(FontAwesomeIcons.line, Color(0xFF06C755))), // LINE
-  _BrandRule(["kakaotalk", "kakao"],
-      ServiceLook(FontAwesomeIcons.kakaoTalk, Color(0xFFFEE500))), // KakaoTalk
-  _BrandRule(["viber"],
-      ServiceLook(FontAwesomeIcons.viber, Color(0xFF7360F2))), // Viber
-  _BrandRule(["signal"],
-      ServiceLook(FontAwesomeIcons.signal, Color(0xFF3A76F0))), // Signal
-  _BrandRule(["skype"],
-      ServiceLook(FontAwesomeIcons.skype, Color(0xFF00AFF0))), // Skype
-  _BrandRule(["zoom", "voov meeting"],
-      ServiceLook(FontAwesomeIcons.zoom, Color(0xFF2D8CFF))), // Zoom
-  _BrandRule(["google chat", "google messenger", "groupme"],
-      ServiceLook(FontAwesomeIcons.commentDots, Color(0xFF00AC47))), // Google chat
-  _BrandRule(["gmail", "=go"],
-      ServiceLook(FontAwesomeIcons.envelope, Color(0xFFEA4335))), // Gmail
-  _BrandRule(["google voice", "textfree", "textnow"],
-      ServiceLook(FontAwesomeIcons.commentSms, Color(0xFF4285F4))), // SMS app
-  _BrandRule(["twilio", "vonage"],
-      ServiceLook(FontAwesomeIcons.commentSms, Color(0xFFF22F46))), // SMS gateway
-  _BrandRule(["google", "gmail"],
-      ServiceLook(FontAwesomeIcons.google, Color(0xFF4285F4))), // Google
-  _BrandRule(["imo", "botim", "yalla", "zalo", "mchat", "tangtan", "tantan", "beboo", "soulapp", "jacob", "weverse", "hily", "tango"],
-      ServiceLook(FontAwesomeIcons.commentDots, Color(0xFF229ED9))), // Messenger
-  _BrandRule(["clubhouse"],
-      ServiceLook(FontAwesomeIcons.microphone, Color(0xFFF0E6D2))), // Clubhouse
-  _BrandRule(["bigo live", "bigo", "kwai", "vidio"],
-      ServiceLook(FontAwesomeIcons.video, Color(0xFFFF4B4B))), // Video app
-  _BrandRule(["any other", "other"],
-      ServiceLook(FontAwesomeIcons.questionCircle, Color(0xFF9E9E9E))), // Other
-  _BrandRule(["full rent", "=full"],
-      ServiceLook(FontAwesomeIcons.infinity, Color(0xFF00FF41))), // Full rent
-  _BrandRule(["tinder", "bumble", "hinge", "okcupid", "ok cupid", "pof", "plenty of fish", "badoo", "mamba", "lovoo", "happn", "skout", "tagged", "meetme", "feeld", "dil mil", "jeevansathi", "shaadi", "cupid", "cupidmedia", "lovescout24", "parship", "muzz", "wooplus", "lovense", "chispa", "justdating", "just dating", "mocospace", "roomster", "=match", "love", "smitten", "milanuncios"],
-      ServiceLook(FontAwesomeIcons.heart, Color(0xFFFF4E6A))), // Dating
-  _BrandRule(["grindr"],
-      ServiceLook(FontAwesomeIcons.heart, Color(0xFFF5A623))), // Grindr
-  _BrandRule(["paypal"],
-      ServiceLook(FontAwesomeIcons.paypal, Color(0xFF00457C))), // PayPal
-  _BrandRule(["stripe"],
-      ServiceLook(FontAwesomeIcons.stripe, Color(0xFF635BFF))), // Stripe
-  _BrandRule(["apple pay"],
-      ServiceLook(FontAwesomeIcons.applePay, Color(0xFF000000))), // Apple Pay
-  _BrandRule(["google pay", "gpay"],
-      ServiceLook(FontAwesomeIcons.googlePay, Color(0xFF4285F4))), // Google Pay
-  _BrandRule(["amazon pay"],
-      ServiceLook(FontAwesomeIcons.amazonPay, Color(0xFFFF9900))), // Amazon Pay
-  _BrandRule(["alipay", "alibaba", "1688", "taobao", "tmall"],
-      ServiceLook(FontAwesomeIcons.alipay, Color(0xFF1677FF))), // Alipay
-  _BrandRule(["unionpay", "visa", "mastercard"],
-      ServiceLook(FontAwesomeIcons.creditCard, Color(0xFF1A1F71))), // Card scheme
-  _BrandRule(["wise", "revolut", "venmo", "cash app", "cashapp", "zelle", "monzo", "monese", "venmo", "square", "sumup", "chime", "varo", "sofi", "current", "chime"],
-      ServiceLook(FontAwesomeIcons.moneyBillTransfer, Color(0xFF00B26B))), // Money app
-  _BrandRule(["skrill", "neteller", "payoneer", "paysera", "paytm", "phonepe", "mobikwik", "freecharge", "true money", "truemoney", "gcash", "dana", "ovo", "gopay", "linkaja", "shopeepay", "doku", "akulaku", "kredivo", "jenius", "maya", "paycell", "papara", "payfix", "iyzico", "qiwi", "webmoney", "payeer", "advcash", "perfect money", "paysafecard", "ecopayz", "bharatpe", "bharat pe", "astrapay", "yoomoney", "yandex money", "moneylion", "remitly", "worldremit", "transfergo", "sendwave", "taptap send", "ria", "paysend", "xoom", "payoneer", "skrill", "neosurf", "paywell", "onepay", "minipay", "qpon", "shopback", "mycashbacks"],
-      ServiceLook(FontAwesomeIcons.wallet, Color(0xFF00A3FF))), // Wallet
-  _BrandRule(["klarna", "clearpay", "afterpay", "affirm", "scalapay", "zilch", "tabby", "tamara", "paypal", "klarna", "paylater"],
-      ServiceLook(FontAwesomeIcons.creditCard, Color(0xFFFFB3C7))), // Buy now pay later
-  _BrandRule(["nubank", "itau", "bradesco", "santander", "caixa", "banco", "bancolombia", "sicredi", "pagbank", "agibank", "capital one", "dbs bank", "ally", "monobank", "privat", "privat24", "tinkoff", "sberbank", "sber", "neftm", "bpi", "bdo", "bca", "mandiri", "bri", "bni", "dbs", "tbank", "tinkoff", "credinex", "unicredit", "raiffeisen"],
-      ServiceLook(FontAwesomeIcons.buildingColumns, Color(0xFF1565C0))), // Bank
-  _BrandRule(["binance", "okx", "bybit", "kucoin", "kcex", "mexc", "bitrue", "bitget", "cryptocom", "crypto com", "cryptonow", "bitcoinbon", "bitso", "bitpay", "coinbase", "kraken", "bitfinex", "huobi", "gate io", "poloniex"],
-      ServiceLook(FontAwesomeIcons.bitcoin, Color(0xFFF7931A))), // Crypto exchange
-  _BrandRule(["metamask", "ethereum", "=eth"],
-      ServiceLook(FontAwesomeIcons.ethereum, Color(0xFF627EEA))), // Ethereum
-  _BrandRule(["bitcoin", "=btc"],
-      ServiceLook(FontAwesomeIcons.bitcoin, Color(0xFFF7931A))), // Bitcoin
-  _BrandRule(["litecoin"],
-      ServiceLook(FontAwesomeIcons.litecoinSign, Color(0xFF345D9D))), // Litecoin
-  _BrandRule(["monero"],
-      ServiceLook(FontAwesomeIcons.monero, Color(0xFFFF6600))), // Monero
-  _BrandRule(["solana"],
-      ServiceLook(FontAwesomeIcons.solana, Color(0xFF9945FF))), // Solana
-  _BrandRule(["tether", "usdt", "tron", "trx"],
-      ServiceLook(FontAwesomeIcons.coins, Color(0xFF26A17B))), // Stablecoin
-  _BrandRule(["moonpay", "trust wallet", "exodus", "wallet"],
-      ServiceLook(FontAwesomeIcons.wallet, Color(0xFFF5A623))), // Crypto wallet
-  _BrandRule(["steam"],
-      ServiceLook(FontAwesomeIcons.steam, Color(0xFF66C0F4))), // Steam
-  _BrandRule(["battlenet", "blizzard"],
-      ServiceLook(FontAwesomeIcons.battleNet, Color(0xFF148EFF))), // Battle.net
-  _BrandRule(["xbox"],
-      ServiceLook(FontAwesomeIcons.xbox, Color(0xFF107C10))), // Xbox
-  _BrandRule(["playstation"],
-      ServiceLook(FontAwesomeIcons.playstation, Color(0xFF003791))), // PlayStation
-  _BrandRule(["epic games", "roblox", "ubisoft", "nexon", "netmarble", "supercell", "nintendo", "pubg", "genshin", "riot games", "ea games", "game", "games", "gaming", "playtime", "taptap", "zynga", "kabam", "razer", "perfect world", "snkrdunk"],
-      ServiceLook(FontAwesomeIcons.gamepad, Color(0xFF7B1FA2))), // Gaming
-  _BrandRule(["minecraft", "tarkov"],
-      ServiceLook(FontAwesomeIcons.cube, Color(0xFF62B47A))), // Game
-  _BrandRule(["amazon"],
-      ServiceLook(FontAwesomeIcons.amazon, Color(0xFFFF9900))), // Amazon
-  _BrandRule(["ebay"],
-      ServiceLook(FontAwesomeIcons.ebay, Color(0xFFE53238))), // eBay
-  _BrandRule(["etsy"],
-      ServiceLook(FontAwesomeIcons.etsy, Color(0xFFF16521))), // Etsy
-  _BrandRule(["shopify"],
-      ServiceLook(FontAwesomeIcons.shopify, Color(0xFF95BF47))), // Shopify
-  _BrandRule(["aliexpress", "alibaba"],
-      ServiceLook(FontAwesomeIcons.cartShopping, Color(0xFFFF4747))), // AliExpress
-  _BrandRule(["shopee"],
-      ServiceLook(FontAwesomeIcons.bagShopping, Color(0xFFEE4D2D))), // Shopee
-  _BrandRule(["lazada", "tokopedia", "bukalapak", "blibli", "jd com", "jdcom", "pinduoduo", "temu", "shein", "wish", "rakuten", "mercado livre", "mercadolivre", "magalu", "americanas", "hepsiburada", "trendyol", "n11", "emag", "allegro", "ozon", "wildberries", "shafa", "sephora", "shop", "store", "mart", "market", "marketplace"],
-      ServiceLook(FontAwesomeIcons.bagShopping, Color(0xFFFF6B00))), // Marketplace
-  _BrandRule(["flipkart", "myntra", "meesho", "snapdeal", "tatacliq", "jiomart", "bigbasket", "zepto", "blinkit", "instamart", "zepto"],
-      ServiceLook(FontAwesomeIcons.cartShopping, Color(0xFF2874F0))), // Indian retail
-  _BrandRule(["swiggy", "zomato", "dunzo", "wolt", "deliveroo", "glovo", "foodora", "foodpanda", "just eat", "doordash", "grubhub", "postmates", "ifood", "rappi", "talabat", "hungerstation", "ubereats", "delivery", "dostavista", "foody", "efood", "=te", "bolt food", "samokat", "yemeksepeti", "getir", "gopuff", "food"],
-      ServiceLook(FontAwesomeIcons.motorcycle, Color(0xFFFF5A00))), // Delivery
-  _BrandRule(["uber"],
-      ServiceLook(FontAwesomeIcons.uber, Color(0xFF276EF1))), // Uber
-  _BrandRule(["lyft"],
-      ServiceLook(FontAwesomeIcons.lyft, Color(0xFFFF00BF))), // Lyft
-  _BrandRule(["bolt"],
-      ServiceLook(FontAwesomeIcons.bolt, Color(0xFF34D186))), // Bolt
-  _BrandRule(["grab"],
-      ServiceLook(FontAwesomeIcons.car, Color(0xFF00B14F))), // Grab
-  _BrandRule(["gojek", "indriver", "maxim", "didi", "cabify", "free now", "freenow", "gett", "blablacar", "bla bla car", "ryde", "careem", "heetch", "uklon", "99app", "ola", "olacabs", "taxi", "ride", "rides", "yandex go", "shuttle", "dott", "voi", "tier", "lime"],
-      ServiceLook(FontAwesomeIcons.car, Color(0xFFFFC400))), // Ride hailing
-  _BrandRule(["walmart", "target", "costco", "best buy", "ikea", "lidl", "aldi", "carrefour", "auchan", "magnit", "pyaterochka", "perekrestok", "dixie", "lenta", "=metro", "7 eleven", "seven eleven", "alfamidi", "alfamart", "indomaret", "lotteria", "dairy farm", "cvs", "walgreens", "boots", "dm", "rossmann", "notino", "watsons", "guardian", "miniso", "daiso", "action", "normal", "circle k", "familymart", "lawson", "ok mart"],
-      ServiceLook(FontAwesomeIcons.store, Color(0xFF4CAF50))), // Store
-  _BrandRule(["vinted", "depop", "poshmark", "dolap", "zara", "h m", "uniqlo", "gap", "shein", "asos", "boohoo", "zalando", "footdistrict", "foot locker", "nike", "adidas", "puma", "reebok", "under armour", "decathlon"],
-      ServiceLook(FontAwesomeIcons.shirt, Color(0xFF00BCD4))), // Fashion
-  _BrandRule(["leboncoin", "marktplaats", "marktde", "kleinanzeigen", "olx", "gumtree", "craigslist", "wallapop", "mercari", "shpock", "offerup", "letgo", "subito", "2dehands", "2ememain", "quoka", "sahibinden", "avito", "youla", "annoncelight", "bazaraki", "jofogas", "hj", "dba", "willhaben"],
-      ServiceLook(FontAwesomeIcons.tag, Color(0xFFFF6E14))), // Classifieds
-  _BrandRule(["nike", "adidas", "puma", "reebok", "shoe", "sneaker"],
-      ServiceLook(FontAwesomeIcons.shoePrints, Color(0xFF111111))), // Footwear
-  _BrandRule(["starbucks", "costa", "caffe nero", "dunkin", "tim hortons", "coffee", "espresso", "cafe", "nero", "chagee", "tealive", "zus coffee", "kopi", "tomoro", "luckin"],
-      ServiceLook(FontAwesomeIcons.mugHot, Color(0xFF00704A))), // Coffee
-  _BrandRule(["mcdonald", "burger king", "wendys", "five guys", "shake shack", "guzman", "burger"],
-      ServiceLook(FontAwesomeIcons.burger, Color(0xFFFFC72C))), // Burgers
-  _BrandRule(["kfc", "popeyes", "drumstick", "nandos"],
-      ServiceLook(FontAwesomeIcons.drumstickBite, Color(0xFFE4002B))), // Fried chicken
-  _BrandRule(["domino", "pizza hut", "pizza", "papa john"],
-      ServiceLook(FontAwesomeIcons.pizzaSlice, Color(0xFFFF0000))), // Pizza
-  _BrandRule(["subway", "sandwich", "greggs", "pret", "bakery", "bread"],
-      ServiceLook(FontAwesomeIcons.breadSlice, Color(0xFF008C15))), // Sandwich
-  _BrandRule(["7 eleven", "seven eleven", "shell", "bp", "chevron", "enilive", "lukoil", "rosneft", "gas", "fuel", "petrol", "caltex", "shellbox", "total energies", "circle k", "q8", "esso", "petronas"],
-      ServiceLook(FontAwesomeIcons.gasPump, Color(0xFFFBCE07))), // Fuel
-  _BrandRule(["coca cola", "cocacola", "pepsi", "red bull", "monster", "drink", "beverage", "corona", "heineken", "budweiser", "beer", "brahma", "tennents", "sy", "prom"],
-      ServiceLook(FontAwesomeIcons.bottleWater, Color(0xFFE53935))), // Drinks
-  _BrandRule(["cadbury", "nestle", "ferrero", "nutella", "hersh", "oreo", "kitkat", "chocolate", "candy", "snack"],
-      ServiceLook(FontAwesomeIcons.cookie, Color(0xFF6D4C41))), // Snacks
-  _BrandRule(["netflix", "disney", "hulu", "prime video", "hbo", "paramount", "crunchyroll", "ivi", "okko", "wink", "zee5", "zeenow", "sonyliv", "hotstar", "mytvsuper", "skytv", "viaplay", "canal", "molotov", "streaming", "movie", "movies", "film", "cinema", "viu", "wetv", "iqiyi", "youku", "bilibili"],
-      ServiceLook(FontAwesomeIcons.play, Color(0xFFE50914))), // Streaming
-  _BrandRule(["spotify"],
-      ServiceLook(FontAwesomeIcons.spotify, Color(0xFF1DB954))), // Spotify
-  _BrandRule(["soundcloud", "deezer", "tidal", "shazam", "audiomack", "joox", "gaana", "wynk", "napster", "pandora", "anghami", "music"],
-      ServiceLook(FontAwesomeIcons.music, Color(0xFFFF5500))), // Music
-  _BrandRule(["rutube", "vimeo", "dailymotion", "kick", "twitch", "video"],
-      ServiceLook(FontAwesomeIcons.video, Color(0xFF1AB7EA))), // Video
-  _BrandRule(["airbnb"],
-      ServiceLook(FontAwesomeIcons.airbnb, Color(0xFFFF5A5F))), // Airbnb
-  _BrandRule(["booking", "hotels com", "agoda", "trivago", "expedia", "hostel", "hotel", "stay", "traveloka", "tikett", "oyo"],
-      ServiceLook(FontAwesomeIcons.bed, Color(0xFF003580))), // Hotels
-  _BrandRule(["trip", "skyscanner", "kiwi", "ryanair", "easyjet", "emirates", "qatar", "turkish airlines", "pegasus", "airlines", "airways", "flight", "fly", "airasia", "lufthansa", "klm", "air france", "iberia", "vueling", "wizz", "jet2", "southwest", "delta", "united", "american airlines", "make my trip", "makemytrip", "yatra", "cleartrip", "tongcheng"],
-      ServiceLook(FontAwesomeIcons.plane, Color(0xFF0288D1))), // Travel
-  _BrandRule(["irctc", "trainline", "sncf", "deutsche bahn", "renfe", "trenitalia", "amtrak", "railway", "rail", "train", "jt express", "whoosh", "swarail"],
-      ServiceLook(FontAwesomeIcons.train, Color(0xFF0F3C8B))), // Rail
-  _BrandRule(["flixbus", "redbus", "bus", "greyhound", "megabus"],
-      ServiceLook(FontAwesomeIcons.bus, Color(0xFFD32F2F))), // Bus
-  _BrandRule(["2gis", "amap", "google maps", "maps", "gps", "navigator"],
-      ServiceLook(FontAwesomeIcons.map, Color(0xFF34A853))), // Maps
-  _BrandRule(["airtel", "jio", "vodafone", "t mobile", "t online", "o2", "orange", "sfr", "bouygues", "=free", "drei", "lycamobile", "lebara", "giffgaff", "=ee", "=three", "mts", "megafon", "beeline", "tele2", "kyivstar", "lifecell", "turkcell", "avea", "zong", "jazz", "ufone", "telenor", "claro", "=vivo", "tim", "=oi", "entel", "movistar", "telcel", "at t", "verizon", "telecom", "mobile", "cellular", "sim", "network", "telefonica", "optus", "telstra", "singtel", "starhub", "globe", "smart"],
-      ServiceLook(FontAwesomeIcons.simCard, Color(0xFF7E57C2))), // Mobile operator
-  _BrandRule(["samsung", "xiaomi", "huawei", "oppo", "realme", "oneplus", "motorola", "nokia", "sony", "lg", "device", "phone", "handset"],
-      ServiceLook(FontAwesomeIcons.mobileScreen, Color(0xFF1565C0))), // Device
-  _BrandRule(["openai", "chatgpt", "claude", "gemini", "grok", "perplexity", "kimi", "grok", "manus", "genspark", "alchemia", "lightning ai", "siliconflow", "volcengine", "sagemaker", "kaggle", "hugging"],
-      ServiceLook(FontAwesomeIcons.robot, Color(0xFF10A37F))), // AI service
-  _BrandRule(["github"],
-      ServiceLook(FontAwesomeIcons.github, Color(0xFF181717))), // GitHub
-  _BrandRule(["gitlab", "bitbucket", "linode", "hostinger", "vercel", "strato", "beget", "cloud", "hosting", "server", "vps", "aws", "azure", "digitalocean", "cloudflare", "firebase", "cloud ru", "uol host", "hostgator", "godaddy", "namecheap"],
-      ServiceLook(FontAwesomeIcons.server, Color(0xFFFF9900))), // Hosting
-  _BrandRule(["slack"],
-      ServiceLook(FontAwesomeIcons.slack, Color(0xFF4A154B))), // Slack
-  _BrandRule(["salesforce"],
-      ServiceLook(FontAwesomeIcons.salesforce, Color(0xFF00A1E0))), // Salesforce
-  _BrandRule(["yahoo", "=mb", "aol", "gmx", "web de", "mail ru", "rediffmail", "protonmail", "zoho", "mail", "email", "tuta", "yandex mail"],
-      ServiceLook(FontAwesomeIcons.envelope, Color(0xFF6001D2))), // Mail
-  _BrandRule(["steam", "epic", "ubisoft"],
-      ServiceLook(FontAwesomeIcons.gamepad, Color(0xFF171A21))), // Games
-  _BrandRule(["bet365", "betfair", "poker", "casino", "slots", "bet", "betting", "sportsbook", "bookmaker", "lottery", "lotto", "bingo", "sport", "sports", "gambling", "oddspedia", "1xbet", "betway", "william hill", "draftkings", "fanduel", "betano", "superbet", "unibet", "paddy power", "sky bet", "betclic", "winamax", "zonabets", "stoiximan", "betflag", "betlive", "betmen", "crystalbet", "eurobet", "admiralbet", "lottomatica", "casino plus", "las vegas", "big cash", "luckyland", "hitnspin", "high 5", "mrq", "mr q", "kwiff", "midnite", "bwin", "betsson"],
-      ServiceLook(FontAwesomeIcons.dice, Color(0xFF43A047))), // Betting
-  _BrandRule(["survey", "surveys", "opinion", "poll", "reward", "rewards", "rewardy", "cashback", "cash back", "points", "prodege", "yougov", "ipsos", "attapoll", "prime opinion", "five surveys", "askable", "prolific", "swagbucks", "inboxdollars", "toluna", "surveyon", "datanyze", "fieldstar", "alig", "radiate"],
-      ServiceLook(FontAwesomeIcons.clipboardList, Color(0xFFFF9800))), // Surveys
-  _BrandRule(["pharmacy", "apteka", "drug", "health", "clinic", "hospital", "doctor", "pill", "medic", "sanofi", "acuvue", "nutriclub", "gymplius", "fitness", "gym", "sportmaster", "ddx fitness", "classpass", "totalpass", "strava", "nike training"],
-      ServiceLook(FontAwesomeIcons.capsules, Color(0xFFE91E63))), // Health
-  _BrandRule(["uber", "taxi"],
-      ServiceLook(FontAwesomeIcons.car, Color(0xFF000000))), // Taxi
-  _BrandRule(["freelance", "upwork", "fiverr", "freelancer", "task", "airtasker", "thumbtack", "taskrabbit", "gigs", "workana", "peopleperhour"],
-      ServiceLook(FontAwesomeIcons.briefcase, Color(0xFF14A800))), // Freelance
-  _BrandRule(["job", "jobs", "career", "hire", "indeed", "linkedin", "hh", "glassdoor", "monster", "ziprecruiter", "jobstreet", "naukri", "infojobs", "pracuj"],
-      ServiceLook(FontAwesomeIcons.briefcase, Color(0xFF0A66C2))), // Jobs
-  _BrandRule(["learn", "course", "school", "academy", "edu", "study", "tutor", "onion academy", "skillshare", "udemy", "coursera", "duolingo", "khan", "quizlet", "brainly", "chegg", "gauth"],
-      ServiceLook(FontAwesomeIcons.graduationCap, Color(0xFF3F51B5))), // Education
-  _BrandRule(["game", "casino"],
-      ServiceLook(FontAwesomeIcons.gamepad, Color(0xFF6A1B9A))), // Games
-  _BrandRule(["apple"],
-      ServiceLook(FontAwesomeIcons.apple, Color(0xFF000000))), // Apple
-  _BrandRule(["microsoft"],
-      ServiceLook(FontAwesomeIcons.microsoft, Color(0xFF00A4EF))), // Microsoft
-  _BrandRule(["=meta"],
-      ServiceLook(FontAwesomeIcons.meta, Color(0xFF0866FF))), // Meta
-  _BrandRule(["yandex"],
-      ServiceLook(FontAwesomeIcons.yandex, Color(0xFFFC3F1D))), // Yandex
-  _BrandRule(["naver", "baidu", "quark", "zhihu", "rediffmail"],
-      ServiceLook(FontAwesomeIcons.magnifyingGlass, Color(0xFF03C75A))), // Search portal
-  _BrandRule(["redbook", "xiaohongshu"],
-      ServiceLook(FontAwesomeIcons.book, Color(0xFFFF2442))), // RedBook
-  _BrandRule(["adobe"],
-      ServiceLook(FontAwesomeIcons.penNib, Color(0xFFFF0000))), // Adobe
-  _BrandRule(["autodesk", "canva", "figma", "sketch"],
-      ServiceLook(FontAwesomeIcons.penRuler, Color(0xFF0696D7))), // Design tool
-  _BrandRule(["docusign", "hellosign", "signnow"],
-      ServiceLook(FontAwesomeIcons.fileSignature, Color(0xFFFFCC22))), // e-Signature
-  _BrandRule(["gofundme", "kickstarter", "patreon", "indiegogo"],
-      ServiceLook(FontAwesomeIcons.handHoldingDollar, Color(0xFF00B964))), // Funding
-  _BrandRule(["nextdoor"],
-      ServiceLook(FontAwesomeIcons.house, Color(0xFF8ED500))), // Nextdoor
-  _BrandRule(["carousell", "redbubble", "grailed", "voggt", "meiqfashion", "gardrops", "oskelly", "vinted"],
-      ServiceLook(FontAwesomeIcons.tag, Color(0xFFFF5722))), // Resale
-  _BrandRule(["truecaller", "caller", "callapp"],
-      ServiceLook(FontAwesomeIcons.phone, Color(0xFF0086FF))), // Caller ID
-  _BrandRule(["opera", "firefox", "chrome", "brave", "browser"],
-      ServiceLook(FontAwesomeIcons.firefoxBrowser, Color(0xFFFF1B2D))), // Browser
-  _BrandRule(["etoro", "tradingview", "binance", "invest", "broker", "trade republic", "scalable", "t212", "xtb", "plus500", "ig group", "cmc markets"],
-      ServiceLook(FontAwesomeIcons.chartLine, Color(0xFF00C805))), // Trading
-  _BrandRule(["mypos", "sumup", "square", "izettle", "clover", "paywell", "getnet", "cielo", "stone", "asaas", "pagaleve", "recargapay", "picpay", "infinite pay", "kredito", "kredivo", "credinex", "ada modal", "bunq", "bipa", "pockit", "finplus", "easycash", "monese", "curve", "zinia", "astropay", "flink", "flink", "tala", "kaito"],
-      ServiceLook(FontAwesomeIcons.creditCard, Color(0xFF00B26B))), // Fintech
-  _BrandRule(["seloger", "immoscout", "idealista", "immowelt", "99acres", "immo", "real estate", "housing", "property", "zillow", "rightmove", "fotocasa", "habitaclia", "casa it", "domclick", "cian", "njuškalo", "njuskalo", "skelbiu", "leolist", "marktplaats"],
-      ServiceLook(FontAwesomeIcons.house, Color(0xFFFF7043))), // Real estate
-  _BrandRule(["novaposhta", "inpost", "cdek", "meest", "dhl", "fedex", "ups", "post", "shipping", "courier", "delivery", "jt express", "jt", "kerry", "flash", "spx", "ninja van", "giao"],
-      ServiceLook(FontAwesomeIcons.truck, Color(0xFFFFB300))), // Shipping
-  _BrandRule(["air miles", "smiles", "bonuslink", "loyalty", "rewards", "rewardy", "myvalue", "gpnbonus", "pockit", "shopback", "mycashbacks", "fetch", "receipt"],
-      ServiceLook(FontAwesomeIcons.star, Color(0xFFFFD700))), // Loyalty
-  _BrandRule(["paddy power", "skybet", "sky bet", "wepoker", "conticazino", "my11circle", "dream11", "rummycircle", "zupee", "winzogame", "opap", "fdj", "parionssport", "crocobet", "betano", "superbet", "stoiximan", "betflag", "betlive", "betmen", "crystalbet", "eurobet", "admiralbet", "lottomatica", "casino plus", "las vegas", "big cash", "luckyland", "hitnspin", "high 5", "mrq", "kwiff", "midnite", "bet365", "betfair", "poker", "casino", "slot", "bingo", "lottery", "lotto", "sportsbook", "bookmaker", "betting", "wager", "gambling", "oddspedia", "1xbet", "betway", "william hill", "draftkings", "fanduel", "unibet", "betclic", "winamax", "stoiximan", "bwin", "betsson", "pariurilor", "winner", "netwin", "twin", "rush", "gg", "d4", "playojo", "ladbrokes", "coral", "pokerstars"],
-      ServiceLook(FontAwesomeIcons.dice, Color(0xFF43A047))), // Betting
-  _BrandRule(["dodopizza", "domino", "pizza", "papa john"],
-      ServiceLook(FontAwesomeIcons.pizzaSlice, Color(0xFFFF0000))), // Pizza
-  _BrandRule(["vkusno i tochka", "burger", "mcdonald", "kfc", "subway", "greggs", "bakery"],
-      ServiceLook(FontAwesomeIcons.burger, Color(0xFFFFC72C))), // Fast food
-  _BrandRule(["eleme", "aiqfome", "keeta", "meituan", "foody", "efood", "hungerstation", "talabat", "deliveroo", "glovo", "wolt", "rappi", "ifood", "just eat", "doordash", "gopuff", "lalamove", "bring", "foodora", "foodpanda", "swiggy", "zomato", "zepto", "blinkit", "instamart", "getir", "grab food"],
-      ServiceLook(FontAwesomeIcons.motorcycle, Color(0xFFFF5A00))), // Delivery
-  _BrandRule(["biedronka", "zabka", "vkusvill", "magnolia", "monetka", "lemana", "obi", "dixie", "aukro", "silpo", "citymall", "jb hi fi", "alfagift", "indopaket", "indosaku", "chocofamily", "flowwow", "shokoladnica", "billa", "kaufland", "tesco", "sainsbury", "asda", "morrisons", "waitrose", "coop", "spar", "migros", "rewe", "edeka", "netto", "penny", "bim", "a101", "sok", "carrefour", "auchan", "=metro", "selgros", "profi", "mega image", "shop", "store", "market", "mart", "supermarket", "grocery", "retail", "outlet", "mall"],
-      ServiceLook(FontAwesomeIcons.store, Color(0xFF4CAF50))), // Store
-  _BrandRule(["allobank", "jago", "seabank", "blu", "bca", "bri", "bni", "mandiri", "cimb", "permata", "danamon", "panin", "mega", "btpn", "nubank", "itau", "bradesco", "santander", "caixa", "inter", "sicredi", "pagbank", "agibank", "banco", "bank", "dbs", "ocbc", "uob", "maybank", "rhb", "hong leong", "ambank", "public bank", "scb", "kasikorn", "krungthai", "bangkok bank", "tmb", "ayudhya", "bpi", "bdo", "metrobank", "landbank", "unionbank", "rcbc", "security bank", "chinabank", "sky", "bancolombia", "davivienda", "bbva", "santander", "hsbc", "barclays", "lloyds", "natwest", "monzo", "starling", "revolut", "n26", "comdirect", "ing", "abn amro", "rabobank", "ing bank", "millennium", "pko", "mbank", "pekao", "alior", "santander bank", "monobank", "privat24", "oschadbank", "ukrsibbank", "raiffeisen", "otp", "kbc", "belfius", "postbank", "sparkasse", "volksbank", "unicredit", "intesa", "bnl", "mps", "credem", "bper", "desio", "bancoposta", "bbva", "caixabank", "sabadell", "bankinter", "abanca", "unicaja", "kutxabank", "ibercaja", "popular", "caja rural"],
-      ServiceLook(FontAwesomeIcons.buildingColumns, Color(0xFF1565C0))), // Bank
-  _BrandRule(["immoscout", "otzovik", "otzyv", "review", "trustpilot", "yelp", "tripadvisor", "sikayet", "sravni", "compare", "check24", "idealo", "price", "shopping comparison"],
-      ServiceLook(FontAwesomeIcons.starHalfStroke, Color(0xFF00AA6C))), // Reviews
-  _BrandRule(["natura", "avon", "oriflame", "mary kay", "cosmetic", "beauty", "makeup", "sephora", "watsons", "guardian", "panvel", "letual", "riv gosh", "beauty"],
-      ServiceLook(FontAwesomeIcons.sprayCan, Color(0xFFE91E63))), // Beauty
-  _BrandRule(["govbr", "gov", "government", "public", "tax", "pension", "bpjstk", "social security", "federal", "municipal", "prefeitura", "detran", "inss", "receita"],
-      ServiceLook(FontAwesomeIcons.landmarkFlag, Color(0xFF1E88E5))), // Government
-  _BrandRule(["crypto", "coin", "token", "nft", "web3"],
-      ServiceLook(FontAwesomeIcons.coins, Color(0xFFF7931A))), // Crypto
-  _BrandRule(["ticketmaster", "kktix", "damai", "guiche", "ticket", "entradas", "tickets"],
-      ServiceLook(FontAwesomeIcons.ticket, Color(0xFF026CDF))), // Ticketing
-  _BrandRule(["mercado", "noon", "tata neu", "rozetka", "lamoda", "yappy", "hopi", "999 md", "mera gaon", "quero quero", "lotus", "continente", "mercadito", "falabella", "ripley", "elektra", "coppel", "liverpool", "suburbia", "chedraui", "soriana", "oxxo", "wong"],
-      ServiceLook(FontAwesomeIcons.bagShopping, Color(0xFFFF6B00))), // Retail
-  _BrandRule(["joyride", "move it", "binbin", "beebs", "motorku", "webmotors", "kolesa", "drom", "poparide", "myboost", "psa", "moto", "scooter", "autoshop", "karos", "drive2", "drive"],
-      ServiceLook(FontAwesomeIcons.car, Color(0xFFFFC400))), // Vehicles
-  _BrandRule(["max", "hot51", "all access", "smotryoshka", "duet", "mvideo", "kinopoisk", "premier", "start", "wink"],
-      ServiceLook(FontAwesomeIcons.play, Color(0xFFE50914))), // Streaming
-  _BrandRule(["paddy power", "paddypower", "sisal", "okbet", "arenaplus", "stanleybet", "stoloto", "bets", "jackpot", "spin", "bti", "bat"],
-      ServiceLook(FontAwesomeIcons.dice, Color(0xFF43A047))), // Betting
-  _BrandRule(["=her", "feels", "finya", "fotka", "feetfinder", "parenteam", "bunda", "veeka", "unni", "fruitz", "salams", "daki", "meeef", "erome", "ero me", "erome", "her", "erotic", "adult", "hookup", "sex", "escort", "onlyfans", "fansly", "stripchat", "chaturbate"],
-      ServiceLook(FontAwesomeIcons.heart, Color(0xFFFF4E6A))), // Dating
-  _BrandRule(["webde", "ukrnet", "sapo", "brevo", "newsletter", "zoho", "news"],
-      ServiceLook(FontAwesomeIcons.envelope, Color(0xFF607D8B))), // Mail
-  _BrandRule(["vfs", "passport", "visa application", "immigration", "embassy"],
-      ServiceLook(FontAwesomeIcons.passport, Color(0xFF1E88E5))), // Immigration
-  _BrandRule(["whatnot", "adverts", "tise", "bazos", "lalafo", "jofogas", "annonce", "annoncelight", "dabble", "marketed", "classified"],
-      ServiceLook(FontAwesomeIcons.tag, Color(0xFFFF6E14))), // Classifieds
-  _BrandRule(["eneba", "codashop", "offgamers", "nttgame", "netease", "boyaa", "gnjoy", "ankama", "zul", "geekay", "loloo", "intel sap", "ncsoft", "thefate", "this fate", "gameloop", "mobapk"],
-      ServiceLook(FontAwesomeIcons.gamepad, Color(0xFF7B1FA2))), // Games
-  _BrandRule(["langit musik", "joox", "anghami", "audible", "podcast", "audiobook"],
-      ServiceLook(FontAwesomeIcons.music, Color(0xFFFF5500))), // Audio
-  _BrandRule(["onet", "rumbler", "jush", "newspaper", "news app", "gazeta", "journal", "press"],
-      ServiceLook(FontAwesomeIcons.newspaper, Color(0xFF455A64))), // News
-  _BrandRule(["rebtel", "keepcalling", "sideline", "ring4", "nao me perturbe", "nao perturbe", "glo", "myglo", "lebara", "voip", "second line", "esim", "airalo", "nomad"],
-      ServiceLook(FontAwesomeIcons.phone, Color(0xFF0086FF))), // Calling
-  _BrandRule(["profee", "lemfi", "ozan", "infinite pay", "revolut", "fairfx", "caxton", "currensea"],
-      ServiceLook(FontAwesomeIcons.moneyBillTransfer, Color(0xFF00B26B))), // Money transfer
-  _BrandRule(["cmb", "mybca", "neon", "next", "upward", "genome", "chime", "monzo", "starling", "n26", "bunq", "tandem", "atom", "zopa"],
-      ServiceLook(FontAwesomeIcons.buildingColumns, Color(0xFF1565C0))), // Bank
-  _BrandRule(["fastwork", "thel", "oneforma", "outlier", "kabanchik", "teamoru", "switchup", "factory", "freelance", "gig", "task", "sidel", "upwork", "fiverr", "freelancer", "workana", "peopleperhour", "airtasker", "thumbtack"],
-      ServiceLook(FontAwesomeIcons.briefcase, Color(0xFF14A800))), // Freelance
-  _BrandRule(["seated", "thefork", "grupo madero", "restaurant", "dining", "resy", "opentable", "food"],
-      ServiceLook(FontAwesomeIcons.utensils, Color(0xFFFF7043))), // Dining
-  _BrandRule(["yara", "farmcare", "farm", "agro", "seed", "agriculture", "tani"],
-      ServiceLook(FontAwesomeIcons.seedling, Color(0xFF4CAF50))), // Agri
-  _BrandRule(["ultragaz", "gas", "fuel", "petrol", "energy", "electric", "lukoil", "shell", "bp", "=esso", "total"],
-      ServiceLook(FontAwesomeIcons.gasPump, Color(0xFFFBCE07))), // Energy
-  _BrandRule(["iqos", "vape", "tobacco", "smoking", "hookah"],
-      ServiceLook(FontAwesomeIcons.smoking, Color(0xFF795548))), // Tobacco
-  _BrandRule(["triumph", "enjoei", "privalia", "fashion", "clothing", "apparel", "garment", "boutique"],
-      ServiceLook(FontAwesomeIcons.shirt, Color(0xFF00BCD4))), // Fashion
-  _BrandRule(["cosmote", "myim3", "im3", "svyaz", "связь", "telco", "operator", "prepaid", "topup", "top up"],
-      ServiceLook(FontAwesomeIcons.simCard, Color(0xFF7E57C2))), // Operator
-  _BrandRule(["alchemy", "serpapi", "intel sap", "sap", "api", "developer", "infra"],
-      ServiceLook(FontAwesomeIcons.server, Color(0xFFFF9900))), // Developer
-  _BrandRule(["reclameaqui", "sikayet", "review", "reviews", "rating", "trustpilot", "complaint"],
-      ServiceLook(FontAwesomeIcons.star, Color(0xFF00AA6C))), // Reviews
-  _BrandRule(["cita previa", "cita", "appointment", "booking slot", "reserva", "schedule"],
-      ServiceLook(FontAwesomeIcons.calendarCheck, Color(0xFF3F51B5))), // Appointments
-  _BrandRule(["pets4homes", "pet", "pets", "vet", "animal"],
-      ServiceLook(FontAwesomeIcons.paw, Color(0xFF8D6E63))), // Pets
-  _BrandRule(["premmia", "gift", "voucher", "giftcard", "reward"],
-      ServiceLook(FontAwesomeIcons.gift, Color(0xFFE91E63))), // Gifts
-  _BrandRule(["warpcast", "mosgram", "ahlan", "wetalk", "bip", "tenchat", "momo", "soul", "chat", "dating"],
-      ServiceLook(FontAwesomeIcons.commentDots, Color(0xFF229ED9))), // Chat
-  _BrandRule(["switchup", "job", "career", "hire", "hiring", "employment"],
-      ServiceLook(FontAwesomeIcons.briefcase, Color(0xFF0A66C2))), // Jobs
-  _BrandRule(["atlas earth", "atlas", "maps", "geo", "location", "local"],
-      ServiceLook(FontAwesomeIcons.map, Color(0xFF34A853))), // Maps
-  _BrandRule(["дикси", "магнолия", "монетка", "лемана", "сільпо", "аптека", "пятёрочка", "перекрёсток", "лента", "ашан", "метро", "вкусвилл", "самокат", "магнит", "оби", "эльдорадо", "детский", "всеинструменты", "золотое", "блинбери", "лейка", "кари", "винлаб", "папer", "paper"],
-      ServiceLook(FontAwesomeIcons.cartShopping, Color(0xFF4CAF50))), // Store (RU)
-  _BrandRule(["столото", "лотерея", "лото"],
-      ServiceLook(FontAwesomeIcons.dice, Color(0xFF43A047))), // Lottery
-  _BrandRule(["почта", "связь", "элплат", "сотовый", "теле2", "билайн", "мегафон", "мтс"],
-      ServiceLook(FontAwesomeIcons.simCard, Color(0xFF7E57C2))), // Operator (RU)
-  _BrandRule(["домклик", "недвижимость", "квартира", "immobili", "immo"],
-      ServiceLook(FontAwesomeIcons.house, Color(0xFFFF7043))), // Real estate
-  _BrandRule(["газпром", "энерго", "энергия", "нефть"],
-      ServiceLook(FontAwesomeIcons.gasPump, Color(0xFFFBCE07))), // Energy (RU)
-  _BrandRule(["везёт", "везет", "такси", "авто", "автору", "моторан", "астра авто"],
-      ServiceLook(FontAwesomeIcons.car, Color(0xFFFFC400))), // Vehicles (RU)
-  _BrandRule(["вплюсе", "вчасно", "куулклевер", "голосза", "санофи", "напоправку", "робота", "работа"],
-      ServiceLook(FontAwesomeIcons.briefcase, Color(0xFF0A66C2))), // Services (RU)
-  _BrandRule(["сеть", "сервис", "центр", "клуб", "групп"],
-      ServiceLook(FontAwesomeIcons.gear, Color(0xFF78909C))), // Service
-];
-
-// Fallbacks used when no specific brand matched the service name.
-const List<_BrandRule> _categoryRules = <_BrandRule>[
-  _BrandRule(["bet", "casino", "slot", "bingo", "poker", "lottery", "lotto", "wager", "sport"], ServiceLook(FontAwesomeIcons.dice, Color(0xFF43A047))),
-  _BrandRule(["bank", "credit", "loan", "finance", "cash", "pay", "wallet", "money", "card", "fintech", "invest", "trade", "broker", "crypto", "coin"], ServiceLook(FontAwesomeIcons.wallet, Color(0xFF00A3FF))),
-  _BrandRule(["shop", "store", "mart", "market", "buy", "deal", "sale", "retail", "mall", "cart"], ServiceLook(FontAwesomeIcons.cartShopping, Color(0xFFFF6B00))),
-  _BrandRule(["food", "eat", "delivery", "restaurant", "pizza", "burger", "coffee", "cafe", "kitchen", "grocery"], ServiceLook(FontAwesomeIcons.motorcycle, Color(0xFFFF7043))),
-  _BrandRule(["travel", "hotel", "flight", "air", "book", "tour", "trip", "bus", "train", "taxi", "ride", "car"], ServiceLook(FontAwesomeIcons.plane, Color(0xFF039BE5))),
-  _BrandRule(["chat", "message", "messenger", "social", "talk", "app", "community", "forum", "date", "dating", "love", "match", "meet", "friend"], ServiceLook(FontAwesomeIcons.commentDots, Color(0xFF229ED9))),
-  _BrandRule(["game", "play", "gaming", "esport"], ServiceLook(FontAwesomeIcons.gamepad, Color(0xFF7B1FA2))),
-  _BrandRule(["tv", "video", "stream", "movie", "music", "radio", "podcast", "film"], ServiceLook(FontAwesomeIcons.play, Color(0xFFE50914))),
-  _BrandRule(["health", "med", "care", "pharm", "clinic", "doctor", "dental", "pill"], ServiceLook(FontAwesomeIcons.heartPulse, Color(0xFFE91E63))),
-  _BrandRule(["school", "learn", "study", "edu", "course", "academy", "university", "tutor"], ServiceLook(FontAwesomeIcons.graduationCap, Color(0xFF3F51B5))),
-  _BrandRule(["mail", "email", "post"], ServiceLook(FontAwesomeIcons.envelope, Color(0xFF607D8B))),
-  _BrandRule(["cloud", "host", "server", "vpn", "tech", "software", "dev", "code"], ServiceLook(FontAwesomeIcons.server, Color(0xFF546E7A))),
-  _BrandRule(["survey", "poll", "opinion", "reward", "point", "cashback"], ServiceLook(FontAwesomeIcons.clipboardList, Color(0xFFFF9800))),
-];
-
-String _normalizeService(String raw) {
-  final low = raw.toLowerCase();
-  final buf = StringBuffer();
-  for (final r in low.runes) {
-    final isWord = (r >= 0x61 && r <= 0x7A) ||
-        (r >= 0x30 && r <= 0x39) ||
-        (r >= 0x400 && r <= 0x4FF);
-    buf.write(isWord ? String.fromCharCode(r) : ' ');
-  }
-  return buf.toString().split(RegExp(r'\s+')).where((e) => e.isNotEmpty).join(' ');
-}
-
-ServiceLook? _resolveRules(List<_BrandRule> rules, String norm, List<String> toks) {
-  for (final rule in rules) {
-    for (final key in rule.keys) {
-      if (key.startsWith('=')) {
-        if (toks.contains(key.substring(1))) return rule.look;
-        continue;
-      }
-      if (key.contains(' ')) {
-        if (norm.contains(key)) return rule.look;
-        continue;
-      }
-      if (toks.contains(key)) return rule.look;
-      if (key.length >= 5 && toks.any((t) => t.endsWith(key))) return rule.look;
-      if (key.length >= 4 && toks.any((t) => t.startsWith(key))) return rule.look;
-    }
-  }
-  return null;
-}
-
-final Map<String, ServiceLook> _serviceLookCache = <String, ServiceLook>{};
-
-ServiceLook getServiceLook(String code, [String name = '']) {
-  final cacheKey = '$code|$name';
-  final cached = _serviceLookCache[cacheKey];
-  if (cached != null) return cached;
-  // Prefer the human readable name; fall back to the code so legacy
-  // getServiceIcon('wa') style calls keep working.
-  final norm = _normalizeService(name.trim().isEmpty ? code : name);
-  final toks = norm.isEmpty ? const <String>[] : norm.split(' ');
-  final look = _resolveRules(_brandRules, norm, toks) ??
-      _resolveRules(_categoryRules, norm, toks) ??
-      const ServiceLook(FontAwesomeIcons.globe, Color(0xFF9E9E9E));
-  _serviceLookCache[cacheKey] = look;
-  return look;
-}
-
-FaIconData getServiceIcon(String code, [String name = '']) => getServiceLook(code, name).icon;
-
-Color getServiceColor(String code, [String name = '']) => getServiceLook(code, name).color;
-
-// ============== LOGIN / REGISTER SCREEN ==============
-class LoginScreen extends StatefulWidget {
-  /// Optional message shown above the form, e.g. "session expired".
-  final String? notice;
-  const LoginScreen({super.key, this.notice});
-  @override
-  State<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreen> {
-  @override
-  void initState() {
-    super.initState();
-    if (widget.notice != null) {
-      _errorMessage = widget.notice!;
-    }
-  }
-
-  final _emailController = TextEditingController();
-  final _passwordController = TextEditingController();
-  final _referralController = TextEditingController();
-  bool _isLoading = false;
-  String _errorMessage = "";
-  bool _showReferralField = false;
-
-  Future<void> _submit(bool isRegister, {bool withReferral = false}) async {
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
-    final referral = withReferral ? _referralController.text.trim().toUpperCase() : "";
-
-    if (email.isEmpty) { setState(() => _errorMessage = "Please enter your email."); return; }
-    if (!email.contains("@") || !email.contains(".")) { setState(() => _errorMessage = "Please enter a valid email address."); return; }
-    if (password.isEmpty) { setState(() => _errorMessage = "Please enter a password."); return; }
-    if (password.length < 6) { setState(() => _errorMessage = "Password must be at least 6 characters."); return; }
-    if (withReferral && referral.isEmpty) { setState(() => _errorMessage = "Please enter the referral code."); return; }
-
-    setState(() { _isLoading = true; _errorMessage = ""; });
-    final endpoint = isRegister ? '/api/register' : '/api/login';
-    final url = Uri.parse('https://grizzly-sms-backend.onrender.com$endpoint');
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    try {
-      final response = await http.post(
-        url,
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"email": email, "password": password, "referral_code": referral}),
-      ).timeout(const Duration(seconds: 90));
-      
-      Map<String, dynamic> data = {};
-      try {
-        final decoded = jsonDecode(response.body);
-        if (decoded is Map<String, dynamic>) data = decoded;
-      } catch (_) {
-        data = {"detail": "Unexpected server response (${response.statusCode})."};
-      }
-
-      final rawId = data['user_id'] ?? data['id'];
-      final int? userId = rawId is int ? rawId : int.tryParse('${rawId ?? ''}');
-      final String userEmail = (data['email'] ?? email).toString();
-
-      if (response.statusCode == 200) {
-        // Save the login token first: every later request proves identity
-        // with it, and the server no longer trusts a user id from the app.
-        await ApiAuth.saveFromResponse(data);
-
-        // Save session for Auto-Login
-        try {
-          final prefs = await SharedPreferences.getInstance();
-          if (userId != null) await prefs.setInt('user_id', userId);
-          await prefs.setString('user_email', userEmail);
-        } catch (e) {
-          print("Could not save session: $e");
-        }
-
-        if (isRegister) {
-          await http.post(
-            Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/request-code'),
-            headers: {"Content-Type": "application/json"},
-            body: jsonEncode({"email": email}),
-          );
-          if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => VerifyEmailScreen(email: email)));
-        } else {
-          if (data['is_verified'] == false) {
-            await http.post(
-              Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/request-code'),
-              headers: {"Content-Type": "application/json"},
-              body: jsonEncode({"email": email}),
-            );
-            if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => VerifyEmailScreen(email: email)));
-          } else {
-            if (userId == null) {
-              setState(() => _errorMessage = "Login worked but the server did not return a user id. Please try again.");
-            } else if (mounted) {
-              Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => HomeScreen(userId: userId, email: userEmail)));
-            }
-          }
-        }
-      } else {
-        setState(() => _errorMessage = fbgClean(data['detail'],
-            fallback: "Something went wrong (${response.statusCode})."));
-      }
-    } on TimeoutException {
-      if (mounted) {
-        setState(() => _errorMessage = "Server is waking up (Render sleeps when idle). Wait ~30 seconds and tap again.");
-      }
-    } catch (e) {
-      final reason = e.toString().split('\n').first;
-      if (mounted) {
-        setState(() => _errorMessage = "Connection failed: $reason");
-      }
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  void _showForgotPassword() async {
-    final controller = TextEditingController();
-    final email = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text("Reset Password", style: TextStyle(color: Color(0xFF00FF41))),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(labelText: "Enter your email"),
-          keyboardType: TextInputType.emailAddress,
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel", style: TextStyle(color: Colors.grey))),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text("Send Code"),
-          ),
-        ],
-      ),
-    );
-
-    if (email != null && email.isNotEmpty) {
-      try {
-        final res = await http.post(
-          Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/forgot-password'),
-          headers: {"Content-Type": "application/json"},
-          body: jsonEncode({"email": email}),
-        );
-        if (res.statusCode == 200) {
-          if (mounted) Navigator.push(context, MaterialPageRoute(builder: (context) => ResetPasswordScreen(email: email)));
-        } else {
-          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Email not found"), backgroundColor: Colors.red));
-        }
-      } catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Connection error"), backgroundColor: Colors.red));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          image: DecorationImage(
-            image: AssetImage('assets/icon.png'),
-            fit: BoxFit.cover,
-            opacity: 0.15,
-          ),
-        ),
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(30.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.sms, size: 80, color: Color(0xFF00FF41)),
-                const SizedBox(height: 20),
-                const Text("FBG SMS", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Color(0xFF00FF41), letterSpacing: 2)),
-                const SizedBox(height: 40),
-                TextField(controller: _emailController, decoration: const InputDecoration(labelText: "Email", prefixIcon: Icon(Icons.email)), keyboardType: TextInputType.emailAddress),
-                const SizedBox(height: 15),
-                TextField(controller: _passwordController, decoration: const InputDecoration(labelText: "Password", prefixIcon: Icon(Icons.lock)), obscureText: true),
-                if (_showReferralField) ...[
-                  const SizedBox(height: 15),
-                  TextField(
-                    controller: _referralController,
-                    decoration: const InputDecoration(
-                      labelText: "Referral Code",
-                      hintText: "FBG-XXXXXX",
-                      prefixIcon: Icon(Icons.card_giftcard, color: Colors.orange),
-                    ),
-                    textCapitalization: TextCapitalization.characters,
-                  ),
-                ],
-                const SizedBox(height: 10),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton(
-                    onPressed: _showForgotPassword,
-                    child: const Text("Forgot Password?", style: TextStyle(color: Colors.grey)),
-                  ),
-                ),
-                if (_errorMessage.isNotEmpty) Text(_errorMessage, style: const TextStyle(color: Colors.red)),
-                const SizedBox(height: 10),
-                if (_isLoading) const CircularProgressIndicator(color: Color(0xFF00FF41)),
-                if (!_isLoading) ...[
-                  ElevatedButton(onPressed: () => _submit(false), style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)), child: const Text("Login")),
-                  const SizedBox(height: 10),
-                  if (!_showReferralField)
-                    OutlinedButton.icon(
-                      onPressed: () => _submit(true),
-                      icon: const Icon(Icons.person_add),
-                      label: const Text("Create Account"),
-                      style: OutlinedButton.styleFrom(minimumSize: const Size(250, 50)),
-                    )
-                  else
-                    ElevatedButton.icon(
-                      onPressed: () => _submit(true, withReferral: true),
-                      icon: const Icon(Icons.card_giftcard),
-                      label: const Text("Create Account with Referral"),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orange,
-                        foregroundColor: Colors.white,
-                        minimumSize: const Size(250, 50),
-                      ),
-                    ),
-                  const SizedBox(height: 10),
-                  TextButton(
-                    onPressed: () => setState(() {
-                      _showReferralField = !_showReferralField;
-                      _errorMessage = "";
-                    }),
-                    child: Text(
-                      _showReferralField ? "Back to normal signup" : "Have a referral code? Tap here",
-                      style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============== VERIFY EMAIL SCREEN ==============
-class VerifyEmailScreen extends StatefulWidget {
-  final String email;
-  const VerifyEmailScreen({super.key, required this.email});
-  @override
-  State<VerifyEmailScreen> createState() => _VerifyEmailScreenState();
-}
-
-class _VerifyEmailScreenState extends State<VerifyEmailScreen> {
-  final _codeController = TextEditingController();
-  bool _isLoading = false;
-  String _errorMessage = "";
-
-  Future<void> _verify() async {
-    final code = _codeController.text.trim();
-    if (code.isEmpty) { setState(() => _errorMessage = "Enter the 6-digit code."); return; }
-
-    setState(() { _isLoading = true; _errorMessage = ""; });
-    try {
-      final res = await http.post(
-        Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/verify-code'),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"email": widget.email, "code": code}),
-      );
-      if (res.statusCode == 200) {
-        // If the backend chooses to hand out a token at this step, keep it.
-        try {
-          final vdata = jsonDecode(res.body);
-          if (vdata is Map<String, dynamic>) await ApiAuth.saveFromResponse(vdata);
-        } catch (_) {}
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Account Verified! Please log in."), backgroundColor: Colors.green));
-          Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
-        }
-      } else {
-        final data = jsonDecode(res.body);
-        setState(() => _errorMessage = fbgClean(data['detail'], fallback: "Invalid code"));
-      }
-    } catch (e) {
-      setState(() => _errorMessage = "Connection failed.");
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text("Verify Email")),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(30.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.mark_email_unread, size: 80, color: Color(0xFF00FF41)),
-              const SizedBox(height: 20),
-              Text("We sent a code to ${widget.email}", textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
-              const SizedBox(height: 30),
-              TextField(
-                controller: _codeController,
-                decoration: const InputDecoration(labelText: "6-Digit Code"),
-                keyboardType: TextInputType.number,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              if (_errorMessage.isNotEmpty) Text(_errorMessage, style: const TextStyle(color: Colors.red)),
-              const SizedBox(height: 20),
-              if (_isLoading) const CircularProgressIndicator(color: Color(0xFF00FF41)),
-              if (!_isLoading)
-                ElevatedButton(
-                  onPressed: _verify,
-                  style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)),
-                  child: const Text("Verify & Continue"),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============== RESET PASSWORD SCREEN ==============
-class ResetPasswordScreen extends StatefulWidget {
-  final String email;
-  const ResetPasswordScreen({super.key, required this.email});
-  @override
-  State<ResetPasswordScreen> createState() => _ResetPasswordScreenState();
-}
-
-class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
-  final _codeController = TextEditingController();
-  final _passController = TextEditingController();
-  bool _isLoading = false;
-  String _errorMessage = "";
-
-  Future<void> _reset() async {
-    final code = _codeController.text.trim();
-    final newPass = _passController.text;
-
-    if (code.isEmpty || newPass.length < 6) {
-      setState(() => _errorMessage = "Enter code and a password (min 6 chars).");
-      return;
-    }
-
-    setState(() { _isLoading = true; _errorMessage = ""; });
-    try {
-      final res = await http.post(
-        Uri.parse('https://grizzly-sms-backend.onrender.com/api/auth/reset-password'),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"email": widget.email, "code": code, "new_password": newPass}),
-      );
-      if (res.statusCode == 200) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Password Reset! Please log in."), backgroundColor: Colors.green));
-          Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
-        }
-      } else {
-        final data = jsonDecode(res.body);
-        setState(() => _errorMessage = fbgClean(data['detail'], fallback: "Invalid code"));
-      }
-    } catch (e) {
-      setState(() => _errorMessage = "Connection failed.");
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text("Reset Password")),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(30.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.lock_reset, size: 80, color: Color(0xFF00FF41)),
-              const SizedBox(height: 20),
-              Text("Enter the code sent to ${widget.email}", textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
-              const SizedBox(height: 30),
-              TextField(
-                controller: _codeController,
-                decoration: const InputDecoration(labelText: "6-Digit Code"),
-                keyboardType: TextInputType.number,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 15),
-              TextField(
-                controller: _passController,
-                decoration: const InputDecoration(labelText: "New Password"),
-                obscureText: true,
-              ),
-              const SizedBox(height: 20),
-              if (_errorMessage.isNotEmpty) Text(_errorMessage, style: const TextStyle(color: Colors.red)),
-              const SizedBox(height: 20),
-              if (_isLoading) const CircularProgressIndicator(color: Color(0xFF00FF41)),
-              if (!_isLoading)
-                ElevatedButton(
-                  onPressed: _reset,
-                  style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)),
-                  child: const Text("Reset Password"),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============== SHARED APP STATE ==============
-class ActiveNumber {
-  final String activationId;
-  final String phoneNumber;
-  final String service;
-  final String serviceLabel;
-  final int country;
-  final String countryLabel;
-  final int totalSeconds;
-  int secondsRemaining;
-  String smsCode;
-  bool expired = false;
-  bool isCancelled = false;
-  int failedChecks = 0;
-  String notice = "";
-
-  Timer? countdownTimer;
-  Timer? pollingTimer;
-  Timer? timeoutTimer;
-
-  ActiveNumber({
-    required this.activationId,
-    required this.phoneNumber,
-    required this.service,
-    this.serviceLabel = "",
-    required this.country,
-    this.countryLabel = "",
-    this.totalSeconds = 420,
-    int? secondsLeft,
-    this.smsCode = "",
-  }) : secondsRemaining = secondsLeft == null
-            ? totalSeconds
-            : (secondsLeft < 0
-                ? 0
-                : (secondsLeft > totalSeconds ? totalSeconds : secondsLeft));
-
-  bool get hasCode => smsCode.isNotEmpty;
-
-  String get displayService {
-    if (serviceLabel.isNotEmpty) return serviceLabel;
-    final cleaned = service.replaceAll(RegExp(r'[-_]+'), ' ').trim();
-    if (cleaned.isEmpty) return service;
-    return cleaned
-        .split(' ')
-        .where((w) => w.isNotEmpty)
-        .map((w) => w[0].toUpperCase() + w.substring(1))
-        .join(' ');
-  }
-
-  void disposeTimers() {
-    countdownTimer?.cancel();
-    pollingTimer?.cancel();
-    timeoutTimer?.cancel();
-  }
-}
-
-class MainAppState extends ChangeNotifier {
-  int userId;
-  String email;
-  double balance = 0.0;
-  String referralCode = "";
-  int referralCount = 0;
-  double referralEarnings = 0.0;
-  List<ActiveNumber> activeNumbers = [];
-  int historyVersion = 0;
-  bool isOffline = false;
-  void Function(ActiveNumber active)? onSmsReceived;
-
-  MainAppState({required this.userId, required this.email});
-
-  void _noteNetwork(bool ok) {
-    if (isOffline == !ok) return;
-    isOffline = !ok;
-    notifyListeners();
-  }
-
-  Future<void> refreshBalance() async {
-    try {
-      final url = Uri.parse('$kApiBase/api/me');
-      final response = await http
-          .get(url, headers: ApiAuth.headers())
-          .timeout(const Duration(seconds: 25));
-      if (response.statusCode == 200) {
-        _noteNetwork(true);
-        final data = jsonDecode(response.body);
-        balance = (data['balance'] ?? 0).toDouble();
-        referralCode = data['referral_code'] ?? "";
-        referralCount = data['referral_count'] ?? 0;
-        referralEarnings = (data['referral_earnings'] ?? 0).toDouble();
-        notifyListeners();
-      } else if (response.statusCode == 401) {
-        ApiAuth.handleUnauthorized();
-      }
-    } catch (e) {
-      _noteNetwork(false);
-    }
-  }
-
-  Future<void> checkForActiveNumbers() async {
-    try {
-      final url = Uri.parse('$kApiBase/api/me/active');
-      final response = await http
-          .get(url, headers: ApiAuth.headers())
-          .timeout(const Duration(seconds: 25));
-      if (response.statusCode == 401) {
-        ApiAuth.handleUnauthorized();
-        return;
-      }
-      if (response.statusCode != 200) return;
-      _noteNetwork(true);
-      final data = jsonDecode(response.body);
-      if (data['has_active'] != true) return;
-      final List<dynamic> activations = data['activations'] ?? [];
-      for (final act in activations) {
-        final id = act['activation_id'].toString();
-        // Never duplicate a card already on screen after a reconnect.
-        if (activeNumbers.any((a) => a.activationId == id)) continue;
-        final service = act['service'].toString();
-        final restored = ActiveNumber(
-          activationId: id,
-          phoneNumber: act['phone_number'].toString(),
-          service: service,
-          serviceLabel: (act['service_name'] ?? act['name'] ?? '').toString(),
-          country: int.tryParse('${act['country'] ?? 0}') ?? 0,
-          countryLabel: (act['country_name'] ?? '').toString(),
-          secondsLeft: _secondsLeftFor(act),
-        );
-        activeNumbers.add(restored);
-        _startTimers(restored);
-      }
-      notifyListeners();
-    } catch (e) {
-      _noteNetwork(false);
-    }
-  }
-
-  /// Works out how long an activation has left, so a page reload does not
-  /// restart the countdown at the full window.
-  int _secondsLeftFor(dynamic act) {
-    for (final key in ['seconds_left', 'expires_in', 'time_left', 'ttl']) {
-      final v = int.tryParse('${act[key] ?? ''}');
-      if (v != null && v > 0) return v;
-    }
-    for (final key in ['created_at', 'created', 'purchased_at']) {
-      final raw = act[key];
-      if (raw == null) continue;
-      try {
-        DateTime? ts;
-        if (raw is num) {
-          ts = DateTime.fromMillisecondsSinceEpoch(
-              raw > 100000000000 ? raw.toInt() : (raw * 1000).toInt(),
-              isUtc: true);
-        } else {
-          ts = DateTime.tryParse(raw.toString());
-        }
-        if (ts == null) continue;
-        final left = 420 - DateTime.now().toUtc().difference(ts.toUtc()).inSeconds;
-        return left;
-      } catch (_) {}
-    }
-    return 420;
-  }
-
-  void startNewActivation({
-    required String phone,
-    required String activationId,
-    required String service,
-    required int country,
-    String serviceName = "",
-    String countryName = "",
-  }) {
-    final newActive = ActiveNumber(
-      activationId: activationId,
-      phoneNumber: phone,
-      service: service,
-      serviceLabel: serviceName,
-      country: country,
-      countryLabel: countryName,
-    );
-    activeNumbers.add(newActive);
-    historyVersion++;
-    _startTimers(newActive);
-    notifyListeners();
-  }
-
-  void _startTimers(ActiveNumber active) {
-    active.disposeTimers();
-
-    active.countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (active.isCancelled || active.hasCode || active.expired) {
-        timer.cancel();
-        return;
-      }
-      if (active.secondsRemaining > 0) {
-        active.secondsRemaining--;
-        notifyListeners();
-      }
-      if (active.secondsRemaining <= 0) {
-        timer.cancel();
-        _expireActivation(active);
-      }
-    });
-
-    _schedulePoll(active, first: true);
-  }
-
-  void _schedulePoll(ActiveNumber active, {bool first = false}) {
-    if (active.isCancelled ||
-        active.expired ||
-        active.hasCode ||
-        active.activationId.isEmpty) {
-      return;
-    }
-    // 3s for the first check, then back off when the server is slow or down.
-    const delays = [3, 5, 5, 8, 12, 20];
-    int idx = first ? 0 : active.failedChecks + 1;
-    if (idx >= delays.length) idx = delays.length - 1;
-    active.pollingTimer = Timer(Duration(seconds: delays[idx]), () async {
-      await _pollOnce(active);
-      _schedulePoll(active);
-    });
-  }
-
-  Future<void> manualCheck(ActiveNumber active) async {
-    active.failedChecks = 0;
-    await _pollOnce(active);
-    if (!active.hasCode && !active.expired) _schedulePoll(active, first: true);
-  }
-
-  Future<void> _pollOnce(ActiveNumber active) async {
-    if (active.isCancelled || active.hasCode || active.activationId.isEmpty) {
-      return;
-    }
-    try {
-      final url = Uri.parse('$kApiBase/api/check-sms/${active.activationId}');
-      final response = await http
-          .get(url, headers: ApiAuth.headers())
-          .timeout(const Duration(seconds: 15));
-      _noteNetwork(true);
-      final result = parseSmsResponse(response.body);
-      if (result.code != null && result.code!.isNotEmpty) {
-        active.smsCode = result.code!;
-        active.failedChecks = 0;
-        active.notice = "";
-        active.disposeTimers();
-        historyVersion++;
-        notifyListeners();
-        onSmsReceived?.call(active);
-      } else if (result.fatalMessage != null) {
-        // The server says this activation can never deliver a code. Stop
-        // polling and explain it, instead of silently waiting out the timer.
-        active.notice = result.fatalMessage!;
-        active.failedChecks = 0;
-        active.isCancelled = true;
-        active.disposeTimers();
-        historyVersion++;
-        notifyListeners();
-      } else {
-        active.failedChecks = 0;
-        notifyListeners();
-      }
-    } catch (e) {
-      active.failedChecks++;
-      _noteNetwork(false);
-      notifyListeners();
-    }
-  }
-
-  /// Interprets one /api/check-sms reply. The backend's `status` field is
-  /// usually a plain upstream status string, but on failure it carries an
-  /// escaped JSON document (for example
-  /// {"status":"{\"title\":\"NOT_FOUND\",\"details\":\"Activation Not Found\"}"}),
-  /// so both shapes have to be understood.
-  static SmsPollResult parseSmsResponse(String body) {
-    if (body.trim().isEmpty) return const SmsPollResult();
-    final trimmed = body.trim();
-    try {
-      final decoded = jsonDecode(trimmed);
-      if (decoded is Map) {
-        var status = (decoded['status'] ?? '').toString().trim();
-        final upper = status.toUpperCase();
-
-        // Error/terminal states: stop polling and tell the customer.
-        if (upper.contains('NOT_FOUND') ||
-            upper.contains('CANCEL') ||
-            upper.contains('BANNED') ||
-            upper.contains('UNPROCESSABLE') ||
-            upper.contains('NO_ACTIVATION')) {
-          var detail = status;
-          try {
-            final inner = jsonDecode(status);
-            if (inner is Map) {
-              detail = (inner['details'] ?? inner['title'] ?? status).toString();
-            }
-          } catch (_) {}
-          return SmsPollResult(fatalMessage: fbgClean(detail));
-        }
-
-        if (upper.contains('STATUS_OK')) {
-          for (final key in ['code', 'sms_code', 'smsCode', 'text', 'message']) {
-            final v = decoded[key];
-            if (v == null) continue;
-            final m = RegExp(r'\d{3,8}').firstMatch(v.toString());
-            if (m != null) return SmsPollResult(code: m.group(0));
-          }
-          final m = RegExp(r'\d{3,8}').firstMatch(trimmed);
-          if (m != null) return SmsPollResult(code: m.group(0));
-          return const SmsPollResult();
-        }
-
-        // Waiting (STATUS_WAIT_CODE / STATUS_WAIT_RETRY / anything unknown).
-        return const SmsPollResult();
-      }
-    } catch (_) {}
-    if (trimmed.contains('STATUS_OK')) {
-      final m = RegExp(r'\d{3,8}').firstMatch(trimmed);
-      if (m != null) return SmsPollResult(code: m.group(0));
-    }
-    return const SmsPollResult();
-  }
-
-  /// Backwards-compatible wrapper returning only the extracted code.
-  static String? extractSmsCode(String body) {
-    return parseSmsResponse(body).code;
-  }
-
-  Future<void> cancelActivation(ActiveNumber active) async {
-    if (active.isCancelled) return;
-    active.isCancelled = true;
-    active.disposeTimers();
-    if (active.activationId.isNotEmpty) {
-      try {
-        await http
-            .post(Uri.parse('$kApiBase/api/cancel/${active.activationId}'),
-                headers: ApiAuth.headers())
-            .timeout(const Duration(seconds: 25));
-        _noteNetwork(true);
-      } catch (e) {
-        _noteNetwork(false);
-      }
-    }
-    activeNumbers.remove(active);
-    historyVersion++;
-    await refreshBalance();
-    notifyListeners();
-  }
-
-  Future<void> _expireActivation(ActiveNumber active) async {
-    if (active.isCancelled || active.hasCode) return;
-    active.expired = true;
-    active.isCancelled = true;
-    active.disposeTimers();
-    historyVersion++;
-    notifyListeners();
-    if (active.activationId.isNotEmpty) {
-      try {
-        await http
-            .post(Uri.parse('$kApiBase/api/cancel/${active.activationId}'),
-                headers: ApiAuth.headers())
-            .timeout(const Duration(seconds: 25));
-        _noteNetwork(true);
-      } catch (e) {
-        _noteNetwork(false);
-      }
-    }
-    await refreshBalance();
-    notifyListeners();
-  }
-
-  void clearActive(ActiveNumber active) {
-    activeNumbers.remove(active);
-    active.disposeTimers();
-    historyVersion++;
-    notifyListeners();
-  }
-
-  String formatTime(int seconds) {
-    final safe = seconds < 0 ? 0 : seconds;
-    final m = (safe ~/ 60).toString();
-    final s = (safe % 60).toString().padLeft(2, '0');
-    return "$m:$s";
-  }
-
-  @override
-  void dispose() {
-    for (var active in activeNumbers) {
-      active.disposeTimers();
-    }
-    super.dispose();
-  }
-}
-
-// ============== HOME SCREEN ==============
-class HomeScreen extends StatefulWidget {
-  final int userId;
-  final String email;
-  const HomeScreen({super.key, required this.userId, required this.email});
-  @override
-  State<HomeScreen> createState() => _HomeScreenState();
-}
-
-class _HomeScreenState extends State<HomeScreen> {
-  int _currentTab = 0;
-  late MainAppState _appState;
-
-  @override
-  void initState() {
-    super.initState();
-    _appState = MainAppState(userId: widget.userId, email: widget.email);
-    _appState.onSmsReceived = _handleSmsReceived;
-    _appState.refreshBalance();
-    _appState.checkForActiveNumbers();
-  }
-
-  /// Fires the moment a code lands: copy it, buzz, and tell the user.
-  Future<void> _handleSmsReceived(ActiveNumber active) async {
-    try {
-      await Clipboard.setData(ClipboardData(text: active.smsCode));
-    } catch (_) {}
-    try {
-      await HapticFeedback.mediumImpact();
-    } catch (_) {}
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text("Code ${active.smsCode} received - copied to clipboard"),
-        backgroundColor: const Color(0xFF00FF41),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 6),
-        action: SnackBarAction(
-          label: "VIEW",
-          textColor: Colors.black,
-          onPressed: () => setState(() => _currentTab = 1),
-        ),
-      ),
-    );
-  }
-
-  @override
-  void dispose() {
-    _appState.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _appState,
-      builder: (context, _) {
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text('FBG SMS', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1)),
-            actions: [
-              Center(child: Text("💰 \$${_appState.balance.toStringAsFixed(2)}", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF00FF41)))),
-              const SizedBox(width: 10),
-            ],
-          ),
-          body: Column(
-            children: [
-              if (_appState.isOffline)
-                Container(
-                  width: double.infinity,
-                  color: Colors.red.shade900,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 15, vertical: 8),
-                  child: const Row(
-                    children: [
-                      Icon(Icons.wifi_off, size: 16, color: Colors.white),
-                      SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          "No connection - retrying automatically",
-                          style: TextStyle(color: Colors.white, fontSize: 12),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              Expanded(
-                child: IndexedStack(
-                  index: _currentTab,
-                  children: [
-                    HomeTab(appState: _appState),
-                    MyNumbersTab(appState: _appState),
-                    ProfileTab(appState: _appState),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          bottomNavigationBar: BottomNavigationBar(
-            currentIndex: _currentTab,
-            onTap: (index) {
-              setState(() => _currentTab = index);
-              if (index == 0) _appState.refreshBalance();
-            },
-            items: const [
-              BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
-              BottomNavigationBarItem(icon: Icon(Icons.phone_android), label: "My Numbers"),
-              BottomNavigationBarItem(icon: Icon(Icons.person), label: "Profile"),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-// ============== HOME TAB ==============
-class HomeTab extends StatefulWidget {
-  final MainAppState appState;
-  const HomeTab({super.key, required this.appState});
-  @override
-  State<HomeTab> createState() => _HomeTabState();
-}
-
-class _HomeTabState extends State<HomeTab> {
-  String _searchQuery = "";
-  String _selectedCategory = "All";
-  bool _isLoading = true;
-  String _errorMessage = "";
-  List<Map<String, String>> _allServices = [];
-  Map<int, String> _countries = {};
-  bool _countriesLoaded = false;
-
-  final List<String> _popularCodes = ["wa", "tg", "fb", "ig", "lf", "go", "tw", "ds", "ub", "am"];
-
-  final Map<String, List<String>> _categoryKeywords = {
-    "Messengers": ["whatsapp", "telegram", "wechat", "chat", "signal", "viber"],
-    "Social": ["facebook", "instagram", "tiktok", "twitter", "reddit", "snapchat", "threads", "douyin"],
-    "Google": ["google", "gmail", "youtube"],
-    "Entertainment": ["netflix", "spotify", "twitch", "ticketmaster"],
-    "Shopping": ["amazon", "shopee", "ebay", "aliexpress", "etsy"],
-    "Gaming": ["discord", "steam", "roblox", "epic"],
-    "Dating": ["tinder", "bumble", "hinge", "badoo"],
-    "Finance": ["paypal", "revolut", "wise", "cash"],
-  };
-
-  @override
-  void initState() {
-    super.initState();
-    _loadServices();
-  }
-
-  String _categorize(String name) {
-    final lower = name.toLowerCase();
-    for (final entry in _categoryKeywords.entries) {
-      for (final kw in entry.value) {
-        if (lower.contains(kw)) return entry.key;
-      }
-    }
-    return "Other";
-  }
-
-  Future<void> _loadServices() async {
-    setState(() { _isLoading = true; _errorMessage = ""; });
-    try {
-      final response = await http.get(Uri.parse('https://grizzly-sms-backend.onrender.com/api/services'));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final List<dynamic> list = data['services'] ?? [];
-        final services = list.map((s) {
-          final code = s['code'].toString();
-          final name = s['name'].toString();
-          return <String, String>{
-            "code": code,
-            "name": name,
-            "category": _categorize(name),
-          };
-        }).toList();
-
-        services.sort((a, b) {
-          final aPop = _popularCodes.indexOf(a["code"]!);
-          final bPop = _popularCodes.indexOf(b["code"]!);
-          if (aPop != -1 && bPop != -1) return aPop.compareTo(bPop);
-          if (aPop != -1) return -1;
-          if (bPop != -1) return 1;
-          return a["name"]!.compareTo(b["name"]!);
-        });
-
-        setState(() { _allServices = services; _isLoading = false; });
-      } else {
-        setState(() { _errorMessage = "Could not load services."; _isLoading = false; });
-      }
-    } catch (e) {
-      setState(() { _errorMessage = "Connection failed. Is the server running?"; _isLoading = false; });
-    }
-  }
-
-  Future<void> _loadCountriesOnce() async {
-    if (_countriesLoaded) return;
-    try {
-      final response = await http.get(Uri.parse('https://grizzly-sms-backend.onrender.com/api/countries'));
-      if (response.statusCode == 200) {
-        final Map<String, dynamic> data = jsonDecode(response.body);
-        Map<int, String> loaded = {};
-        data.forEach((key, value) {
-          if (value is Map) {
-            final int countryId = int.parse(key);
-            final String countryName = (value['eng'] ?? value['rus'] ?? "Country $key").toString();
-            
-            if (countryId == 1 || value['visible'] == 1 || value['visible'] == null) {
-              loaded[countryId] = countryName;
-            }
-          }
-        });
-        _countries = loaded;
-        _countriesLoaded = true;
-      }
-    } catch (e) {}
-  }
-
-  List<Map<String, String>> get _filteredServices {
-    return _allServices.where((s) {
-      final matchCategory = _selectedCategory == "All" || s["category"] == _selectedCategory;
-      final matchSearch = _searchQuery.isEmpty ||
-          s["name"]!.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-          s["code"]!.toLowerCase().contains(_searchQuery.toLowerCase());
-      return matchCategory && matchSearch;
-    }).toList();
-  }
-
-  Future<void> _onServiceTap(String serviceKey, String serviceName) async {
-    await _loadCountriesOnce();
-
-    Map<int, double> prices = {};
-    try {
-      final pResp = await http.get(Uri.parse('https://grizzly-sms-backend.onrender.com/api/prices?service=$serviceKey'));
-      if (pResp.statusCode == 200) {
-        final data = jsonDecode(pResp.body);
-        data.forEach((countryCode, serviceData) {
-          if (serviceData[serviceKey] != null) {
-            prices[int.parse(countryCode)] = (serviceData[serviceKey]['cost'] as num).toDouble();
-          }
-        });
-      }
-    } catch (e) {}
-
-    if (!mounted) return;
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: const Color(0xFF1A1A1A),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (context) => CountryPickerSheet(
-        countries: _countries,
-        popularNames: const ["United States", "United Kingdom", "Indonesia", "India", "Philippines", "Russia", "Nigeria", "South Africa"],
-        selectedId: null,
-        prices: prices.map((k, v) => MapEntry(k.toString(), v)),
-        onSelected: (id, name) async {
-          await _buyNumber(serviceKey, serviceName, id);
-        },
-      ),
-    );
-  }
-
-  Future<void> _buyNumber(String serviceKey, String serviceName, int country) async {
-    try {
-      final url = Uri.parse('https://grizzly-sms-backend.onrender.com/api/buy-number');
-      final response = await http.post(
-        url,
-        headers: ApiAuth.headers({"Content-Type": "application/json"}),
-        body: jsonEncode({"user_id": widget.appState.userId, "service": serviceKey, "country": country}),
-      );
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        widget.appState.startNewActivation(
-          phone: data['phone_number'],
-          activationId: data['activation_id'],
-          service: serviceKey,
-          serviceName: serviceName,
-          country: country,
-          countryName: _countries[country] ?? "",
-        );        await widget.appState.refreshBalance();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("$serviceName number bought! Check 'My Numbers' tab."), backgroundColor: Colors.green),
-          );
-        }
-      } else if (response.statusCode == 401) {
-        ApiAuth.handleUnauthorized();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Your session expired. Please log in again."), backgroundColor: Colors.red),
-          );
-        }
-      } else {
-        final data = jsonDecode(response.body);
-        final message = fbgClean(data['detail'],
-            fallback: "FBGSMS could not complete this order. Try another country or service.");
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(message), backgroundColor: Colors.red),
-          );
-        }
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Connection failed."), backgroundColor: Colors.red));
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final services = _filteredServices;
-    final Set<String> cats = {"All"};
-    for (final s in _allServices) {
-      if (s["category"] != null) cats.add(s["category"]!);
-    }
-    final categories = cats.toList();
-
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(15),
-          child: TextField(
-            onChanged: (v) => setState(() => _searchQuery = v),
-            decoration: InputDecoration(
-              hintText: "Search ${_allServices.length} services",
-              prefixIcon: const Icon(Icons.search),
-              contentPadding: const EdgeInsets.symmetric(horizontal: 20),
-            ),
-          ),
-        ),
-        SizedBox(
-          height: 40,
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 15),
-            itemCount: categories.length,
-            itemBuilder: (context, i) {
-              final cat = categories[i];
-              final selected = _selectedCategory == cat;
-              return Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: ChoiceChip(
-                  label: Text(cat),
-                  selected: selected,
-                  selectedColor: const Color(0xFF00FF41),
-                  backgroundColor: const Color(0xFF1A1A1A),
-                  labelStyle: TextStyle(color: selected ? Colors.black : Colors.white, fontWeight: FontWeight.w600),
-                  onSelected: (_) => setState(() => _selectedCategory = cat),
-                ),
-              );
-            },
-          ),
-        ),
-        const SizedBox(height: 10),
-        Expanded(
-          child: _isLoading
-              ? const Center(child: CircularProgressIndicator(color: Color(0xFF00FF41)))
-              : _errorMessage.isNotEmpty
-                  ? Center(child: Text(_errorMessage, style: const TextStyle(color: Colors.red)))
-                  : services.isEmpty
-                      ? const Center(child: Text("No services found.", style: TextStyle(color: Colors.grey)))
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 15),
-                          itemCount: services.length,
-                          itemBuilder: (context, i) {
-                            final s = services[i];
-                            final code = s["code"]!;
-                            final icon = getServiceIcon(code, s["name"]!);
-                            final color = getServiceColor(code, s["name"]!);
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 10),
-                              child: ListTile(
-                                leading: Container(
-                                  width: 45, height: 45,
-                                  decoration: BoxDecoration(
-                                    color: color.withValues(alpha: 0.15),
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  alignment: Alignment.center,
-                                  child: FaIcon(icon, color: color, size: 22),
-                                ),
-                                title: Text(s["name"]!, style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.white)),
-                                trailing: const Icon(Icons.arrow_forward_ios, size: 16, color: Color(0xFF00FF41)),
-                                onTap: () => _onServiceTap(code, s["name"]!),
-                              ),
-                            );
-                          },
-                        ),
-        ),
-      ],
-    );
-  }
-}
-
-// ============== MY NUMBERS TAB ==============
-class MyNumbersTab extends StatefulWidget {
-  final MainAppState appState;
-  const MyNumbersTab({super.key, required this.appState});
-  @override
-  State<MyNumbersTab> createState() => _MyNumbersTabState();
-}
-
-class _MyNumbersTabState extends State<MyNumbersTab> {
-  List<dynamic> _history = [];
-  bool _isLoadingHistory = true;
-  int _lastHistoryVersion = -1;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.appState.addListener(_onAppStateChange);
-    _loadHistory();
-  }
-
-  @override
-  void dispose() {
-    widget.appState.removeListener(_onAppStateChange);
-    super.dispose();
-  }
-
-  void _onAppStateChange() {
-    if (widget.appState.historyVersion != _lastHistoryVersion) {
-      _lastHistoryVersion = widget.appState.historyVersion;
-      _loadHistory();
-    }
-  }
-
-  Future<void> _loadHistory() async {
-    setState(() => _isLoadingHistory = true);
-    final url = Uri.parse('$kApiBase/api/me/history');
-    try {
-      final response = await http.get(url, headers: ApiAuth.headers());
-      if (response.statusCode == 401) {
-        ApiAuth.handleUnauthorized();
-        return;
-      }
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        setState(() => _history = data['history']);
-      }
-    } catch (e) {} finally { setState(() => _isLoadingHistory = false); }
-  }
-
-  Color _statusColor(String status) {
-    if (status == "COMPLETED") return const Color(0xFF00FF41);
-    if (status == "CANCELLED") return Colors.red;
-    return Colors.orange;
-  }
-
-  String _statusLabel(String status) {
-    if (status == "COMPLETED") return "Used";
-    if (status == "CANCELLED") return "Cancelled";
-    return "Pending";
-  }
-
-  IconData _statusIcon(String status) {
-    if (status == "COMPLETED") return Icons.check_circle;
-    if (status == "CANCELLED") return Icons.cancel;
-    return Icons.hourglass_top;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.appState,
-      builder: (context, _) {
-        final a = widget.appState;
-
-        return Column(
-          children: [
-            if (a.activeNumbers.isNotEmpty) ...[
-              const Padding(
-                padding: EdgeInsets.fromLTRB(20, 15, 20, 5),
-                child: Row(
-                  children: [
-                    Icon(Icons.hourglass_top, size: 20, color: Color(0xFF00FF41)),
-                    SizedBox(width: 8),
-                    Text("Active Numbers", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
-                  ],
-                ),
-              ),
-              Flexible(
-                fit: FlexFit.loose,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 350),
-                  child: ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 15),
-                    itemCount: a.activeNumbers.length,
-                    itemBuilder: (context, i) {
-                      final active = a.activeNumbers[i];
-                      return _ActiveNumberCard(active: active, appState: a);
-                    },
-                  ),
-                ),
-              ),
-            ],
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 15, 20, 5),
-              child: Row(
-                children: [
-                  Icon(Icons.history, size: 20, color: Color(0xFF00FF41)),
-                  SizedBox(width: 8),
-                  Text("History", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
-                ],
-              ),
-            ),
-            Expanded(
-              child: _isLoadingHistory
-                  ? const Center(child: CircularProgressIndicator(color: Color(0xFF00FF41)))
-                  : _history.isEmpty
-                      ? const Center(child: Text("No past numbers yet.", style: TextStyle(color: Colors.grey)))
-                      : RefreshIndicator(
-                          onRefresh: _loadHistory,
-                          child: ListView.builder(
-                            padding: const EdgeInsets.symmetric(horizontal: 15),
-                            itemCount: _history.length,
-                            itemBuilder: (context, i) {
-                              final tx = _history[i];
-                              final status = tx['status'].toString();
-                              return Card(
-                                margin: const EdgeInsets.only(bottom: 10),
-                                child: ListTile(
-                                  leading: Icon(_statusIcon(status), color: _statusColor(status), size: 32),
-                                  title: Text(tx['phone_number'], style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                                  subtitle: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      const SizedBox(height: 4),
-                                      Row(
-                                        children: [
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                            decoration: BoxDecoration(
-                                              color: _statusColor(status).withValues(alpha: 0.15),
-                                              borderRadius: BorderRadius.circular(4),
-                                            ),
-                                            child: Text(_statusLabel(status), style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.bold)),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Text("Service: ${tx['service']}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                                        ],
-                                      ),
-                                      if (tx['sms_code'] != null && tx['sms_code'].toString().isNotEmpty)
-                                        Padding(
-                                          padding: const EdgeInsets.only(top: 4),
-                                          child: Text("Code: ${tx['sms_code']}", style: const TextStyle(color: Color(0xFF00FF41), fontWeight: FontWeight.bold, fontSize: 13)),
-                                        ),
-                                    ],
-                                  ),
-                                  trailing: Text("\$${tx['cost']}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-
-class _ActiveNumberCard extends StatelessWidget {
-  final ActiveNumber active;
-  final MainAppState appState;
-  const _ActiveNumberCard({required this.active, required this.appState});
-
-  void _toast(BuildContext context, String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: const Color(0xFF00FF41),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
-      ),
-    );
-  }
-
-  Future<void> _copy(BuildContext context, String value, String label) async {
-    try {
-      await Clipboard.setData(ClipboardData(text: value));
-    } catch (_) {}
-    try {
-      await HapticFeedback.selectionClick();
-    } catch (_) {}
-    if (context.mounted) _toast(context, "$label copied");
-  }
-
-  Future<void> _confirmCancel(BuildContext context) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text("Cancel this number?"),
-        content: Text(
-          "The number is released and the price goes back to your balance.\n\n${active.phoneNumber}",
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text("Keep waiting", style: TextStyle(color: Colors.grey)),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.red, foregroundColor: Colors.white),
-            child: const Text("Cancel number"),
-          ),
-        ],
-      ),
-    );
-    if (ok == true) await appState.cancelActivation(active);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final hasCode = active.hasCode;
-    final expired = active.expired;
-    final accent = hasCode
-        ? const Color(0xFF00FF41)
-        : (expired ? Colors.red : Colors.orange);
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(14),
-        side: BorderSide(color: accent.withValues(alpha: 0.45)),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(15),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  hasCode
-                      ? Icons.mark_email_read
-                      : (expired ? Icons.timer_off : Icons.schedule),
-                  size: 18,
-                  color: accent,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    active.displayService,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 15,
-                        color: Colors.white),
-                  ),
-                ),
-                if (active.countryLabel.isNotEmpty) ...[
-                  Text(active.countryLabel,
-                      style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                  const SizedBox(width: 8),
-                ],
-                Text(
-                  hasCode
-                      ? "RECEIVED"
-                      : (expired
-                          ? "EXPIRED"
-                          : appState.formatTime(active.secondsRemaining)),
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 13,
-                    color: hasCode
-                        ? const Color(0xFF00FF41)
-                        : (expired
-                            ? Colors.red
-                            : (active.secondsRemaining > 60
-                                ? const Color(0xFF00FF41)
-                                : Colors.orange)),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: SelectableText(
-                    active.phoneNumber,
-                    style: const TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                        letterSpacing: 0.5),
-                  ),
-                ),
-                IconButton(
-                  tooltip: "Copy number",
-                  icon: const Icon(Icons.copy, size: 20, color: Color(0xFF00FF41)),
-                  onPressed: () => _copy(context, active.phoneNumber, "Number"),
-                ),
-              ],
-            ),
-            if (!hasCode && !expired) ...[
-              const SizedBox(height: 2),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (active.notice.isEmpty)
-                    const SizedBox(
-                        width: 13,
-                        height: 13,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Color(0xFF00FF41)))
-                  else
-                    const Icon(Icons.error_outline,
-                        size: 15, color: Colors.orange),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      active.notice.isNotEmpty
-                          ? active.notice
-                          : (active.failedChecks > 0
-                              ? "Connection issue - retrying shortly"
-                              : "Waiting for SMS - checks run automatically"),
-                      style: TextStyle(
-                          fontSize: 11,
-                          color: active.notice.isNotEmpty
-                              ? Colors.orange
-                              : Colors.grey),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-            if (hasCode) ...[
-              const SizedBox(height: 12),
-              Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF00FF41).withValues(alpha: 0.10),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                      color: const Color(0xFF00FF41).withValues(alpha: 0.35)),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            "SMS CODE",
-                            style: TextStyle(
-                                fontSize: 10,
-                                letterSpacing: 1.2,
-                                color: Colors.grey,
-                                fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 2),
-                          SelectableText(
-                            active.smsCode,
-                            style: const TextStyle(
-                                fontSize: 24,
-                                fontWeight: FontWeight.bold,
-                                color: Color(0xFF00FF41),
-                                letterSpacing: 3),
-                          ),
-                        ],
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: "Copy code",
-                      icon: const Icon(Icons.copy_all, color: Color(0xFF00FF41)),
-                      onPressed: () => _copy(context, active.smsCode, "Code"),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            if (expired) ...[
-              const SizedBox(height: 10),
-              const Text(
-                "No SMS arrived in time. The number was released and the price refunded.",
-                style: TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-            ],
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                if (!hasCode && !expired) ...[
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => appState.manualCheck(active),
-                      icon: const Icon(Icons.refresh, size: 18),
-                      label: const Text("Check now"),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: const Color(0xFF00FF41),
-                        side: const BorderSide(color: Color(0xFF00FF41)),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () => _confirmCancel(context),
-                      icon: const Icon(Icons.cancel, size: 18),
-                      label: const Text("Cancel"),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.red,
-                        side: const BorderSide(color: Colors.red),
-                      ),
-                    ),
-                  ),
-                ] else
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: () => appState.clearActive(active),
-                      icon: const Icon(Icons.check),
-                      label: Text(hasCode ? "Done" : "Dismiss"),
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF00FF41),
-                          foregroundColor: Colors.black),
-                    ),
-                  ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ============== PROFILE TAB ==============
-class ProfileTab extends StatelessWidget {
-  final MainAppState appState;
-  const ProfileTab({super.key, required this.appState});
-
-  Future<void> _showTopUpDialog(BuildContext context, {String? method}) async {
-    final controller = TextEditingController(text: "5");
-    final amount = await showDialog<double>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text("Add Funds", style: TextStyle(color: Color(0xFF00FF41))),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text("Enter amount in USD (min \$1.00):"),
-            const SizedBox(height: 10),
-            TextField(
-              controller: controller,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(
-                prefixText: "\$ ",
-              ),
-            ),
-            const SizedBox(height: 10),
-            const Text("For payments under \$20, please use USDT (TRC20) or Litecoin (LTC) on the checkout page to avoid high Bitcoin fees.", style: TextStyle(fontSize: 12, color: Colors.orange)),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel", style: TextStyle(color: Colors.grey))),
-          ElevatedButton(
-            onPressed: () {
-              final val = double.tryParse(controller.text);
-              if (val != null && val >= 1.0) {
-                Navigator.pop(context, val);
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Minimum is \$1.00"), backgroundColor: Colors.red));
-              }
-            },
-            child: const Text("Continue"),
-          ),
-        ],
-      ),
-    );
-
-    if (amount == null) return;
-    if (!context.mounted) return;
-
-    if (method == "crypto") {
-      _showPaymentChoice(context, amount);
-    } else if (method == "card") {
-      _startNowPayments(context, amount);
-    } else {
-      _showPaymentChoice(context, amount);
-    }
-  }
-
-  // Coins enabled on the Apirone account. code | display name | symbol | brand colour
-  static const List<List<String>> _cryptoCoins = [
-    ["btc", "Bitcoin", "BTC", "0xFFF7931A"],
-    ["eth", "Ethereum", "ETH", "0xFF627EEA"],
-    ["usdt@trx", "Tether USDT (TRC20)", "USDT", "0xFF26A17B"],
-    ["usdc@trx", "USD Coin (TRC20)", "USDC", "0xFF2775CA"],
-    ["usdt@eth", "Tether USDT (ERC20)", "USDT", "0xFF26A17B"],
-    ["usdc@eth", "USD Coin (ERC20)", "USDC", "0xFF2775CA"],
-    ["usdt@bnb", "Tether USDT (BEP20)", "USDT", "0xFF26A17B"],
-    ["usdt@ton", "Tether USDT (TON)", "USDT", "0xFF0098EA"],
-    ["ltc", "Litecoin", "LTC", "0xFF345D9D"],
-    ["bch", "Bitcoin Cash", "BCH", "0xFF8DC351"],
-    ["doge", "Dogecoin", "DOGE", "0xFFC2A633"],
-    ["trx", "TRON", "TRX", "0xFFE50915"],
-    ["bnb", "BNB", "BNB", "0xFFF3BA2F"],
-  ];
-
-  void _showPaymentChoice(BuildContext context, double amount) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF1A1A1A),
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                "Pay \$${amount.toStringAsFixed(2)} with",
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 15, color: Colors.white70),
-              ),
-              const SizedBox(height: 4),
-              const Text(
-                "Choose Payment Method",
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00FF41)),
-              ),
-              const SizedBox(height: 16),
-              ElevatedButton.icon(
-                onPressed: () {
-                  Navigator.pop(ctx);
-                  _startNowPayments(context, amount);
-                },
-                icon: const Icon(Icons.credit_card, size: 20),
-                label: const Text("Card / Crypto checkout (NOWPayments)"),
-                style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(0, 48),
-                  backgroundColor: Colors.orange,
-                  foregroundColor: Colors.black,
-                  textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
-                ),
-              ),
-              const SizedBox(height: 16),
-              const Row(
-                children: [
-                  Expanded(child: Divider(color: Colors.white24)),
-                  Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 10),
-                    child: Text("or pay with", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  ),
-                  Expanded(child: Divider(color: Colors.white24)),
-                ],
-              ),
-              const SizedBox(height: 4),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 300),
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: _cryptoCoins.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white12),
-                  itemBuilder: (c, i) {
-                    final coin = _cryptoCoins[i];
-                    final Color brand = Color(int.parse(coin[3]));
-                    return ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      leading: CircleAvatar(
-                        radius: 14,
-                        backgroundColor: brand.withValues(alpha: 0.22),
-                        child: Text(
-                          coin[2].substring(0, 1),
-                          style: TextStyle(color: brand, fontSize: 12, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                      title: Text(coin[1], style: const TextStyle(color: Colors.white, fontSize: 14)),
-                      subtitle: Text(coin[2], style: const TextStyle(color: Colors.grey, fontSize: 11)),
-                      trailing: const Icon(Icons.chevron_right, size: 18, color: Colors.grey),
-                      onTap: () {
-                        Navigator.pop(ctx);
-                        _startApirone(context, amount, coin[0]);
-                      },
-                    );
-                  },
-                ),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Future<void> _startNowPayments(BuildContext context, double amount) async {
-    try {
-      final res = await http.post(
-        Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-invoice'),
-        headers: ApiAuth.headers({"Content-Type": "application/json"}),
-        body: jsonEncode({"user_id": appState.userId, "amount": amount}),
-      ).timeout(const Duration(seconds: 90));
-
-      if (res.statusCode == 200) {
-        Map<String, dynamic> data = {};
-        try {
-          final decoded = jsonDecode(res.body);
-          if (decoded is Map<String, dynamic>) data = decoded;
-        } catch (_) {}
-        final linkRaw = data['invoice_url'] ?? data['payment_url'] ?? data['url'] ?? data['invoice_link'];
-        if (linkRaw == null || linkRaw.toString().isEmpty || linkRaw.toString() == 'null') {
-          if (context.mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text("No payment link returned by server: ${res.body}"), backgroundColor: Colors.red),
-            );
-          }
-          return;
-        }
-
-        final url = Uri.parse(linkRaw.toString());
-        bool opened = false;
-        try {
-          opened = await launchUrl(url, mode: LaunchMode.externalApplication);
-        } catch (e) {
-          opened = false;
-        }
-        if (!opened) {
-          if (context.mounted) _showLinkDialog(context, url.toString());
-        }
-        Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
-      } else {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Invoice failed (${res.statusCode}): ${res.body}"), backgroundColor: Colors.red),
-          );
-        }
-      }
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Payment error: ${e.toString().split('\n').first}"), backgroundColor: Colors.red),
-        );
-      }
-    }
-  }
-
-  Future<void> _startApirone(BuildContext context, double amount, String currency) async {
-    try {
-      final res = await http.post(
-        Uri.parse('https://grizzly-sms-backend.onrender.com/api/payment/create-btc-invoice'),
-        headers: ApiAuth.headers({"Content-Type": "application/json"}),
-        body: jsonEncode({"user_id": appState.userId, "amount": amount, "currency": currency}),
-      ).timeout(const Duration(seconds: 90));
-
-      if (res.statusCode == 200) {
-        Map<String, dynamic> data = {};
-        try {
-          final decoded = jsonDecode(res.body);
-          if (decoded is Map<String, dynamic>) data = decoded;
-        } catch (_) {}
-        final invoiceUrl = data['invoice_url'] ?? data['invoice-url'] ?? data['payment_url'] ?? data['url'] ?? data['invoice_link'];
-        final btcAddress = data['address'];
-        final btcAmount = data['amount_btc'];
-
-        if (invoiceUrl != null && invoiceUrl.toString().isNotEmpty) {
-          final url = Uri.parse(invoiceUrl.toString());
-          bool opened = false;
-          try {
-            opened = await launchUrl(url, mode: LaunchMode.externalApplication);
-          } catch (e) {
-            opened = false;
-          }
-          if (!opened) {
-            if (context.mounted) _showLinkDialog(context, invoiceUrl.toString());
-          }
-          Future.delayed(const Duration(seconds: 5), () => appState.refreshBalance());
-        } else if (btcAddress != null) {
-          if (context.mounted) {
-            showDialog(
-              context: context,
-              builder: (context) => AlertDialog(
-                backgroundColor: const Color(0xFF1A1A1A),
-                title: const Text("Send Bitcoin", style: TextStyle(color: Color(0xFF00FF41))),
-                content: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text("Send exactly:", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                    const SizedBox(height: 4),
-                    SelectableText("${btcAmount ?? ''} BTC", style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold, fontSize: 16)),
-                    const SizedBox(height: 12),
-                    const Text("To this address:", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                    const SizedBox(height: 4),
-                    SelectableText(btcAddress, style: const TextStyle(color: Colors.white, fontSize: 13)),
-                    const SizedBox(height: 12),
-                    const Text("Your balance will update automatically after confirmation.", style: TextStyle(color: Colors.orange, fontSize: 11)),
-                  ],
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text("Close", style: TextStyle(color: Colors.grey)),
-                  ),
-                ],
-              ),
-            );
-          }
-        } else {
-          if (context.mounted) _cryptoFallback(context, amount);
-        }
-      } else {
-        // Apirone gateway is misconfigured or down: keep the user able to pay
-        // through the working NOWPayments crypto checkout instead of dead-ending.
-        if (context.mounted) _cryptoFallback(context, amount);
-      }
-    } catch (e) {
-      if (context.mounted) _cryptoFallback(context, amount);
-    }
-  }
-
-  Future<void> _cryptoFallback(BuildContext context, double amount) async {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Bitcoin gateway unavailable - opening crypto checkout instead"),
-          backgroundColor: Colors.orange,
-          duration: Duration(seconds: 4),
-        ),
-      );
-    }
-    await _startNowPayments(context, amount);
-  }
-
-  void _showLinkDialog(BuildContext context, String link) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A1A),
-        title: const Text("Payment Link", style: TextStyle(color: Color(0xFF00FF41))),
-        content: SelectableText(
-          "Please copy this link and open it in your browser to pay:\n\n$link",
-          style: const TextStyle(color: Colors.white),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Close", style: TextStyle(color: Colors.grey)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: appState,
-      builder: (context, _) {
-        return SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            children: [
-              const SizedBox(height: 20),
-              CircleAvatar(
-                radius: 45,
-                backgroundColor: const Color(0xFF00FF41).withValues(alpha: 0.2),
-                child: Text(
-                  appState.email.isNotEmpty ? appState.email[0].toUpperCase() : "?",
-                  style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Color(0xFF00FF41)),
-                ),
-              ),
-              const SizedBox(height: 15),
-              Text(appState.email, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: Colors.white)),
-              const SizedBox(height: 30),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      const Text("Wallet Balance", style: TextStyle(fontSize: 14, color: Colors.grey)),
-                      const SizedBox(height: 10),
-                      Text("\$${appState.balance.toStringAsFixed(2)}", style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: Color(0xFF00FF41))),
-                      const SizedBox(height: 15),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: ElevatedButton.icon(
-                              onPressed: () => _showTopUpDialog(context, method: "crypto"),
-                              icon: const Icon(Icons.currency_bitcoin),
-                              label: const Text("Crypto"),
-                              style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50),
-                                backgroundColor: Colors.orange,
-                                foregroundColor: Colors.white,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: ElevatedButton.icon(
-                              onPressed: () => _showTopUpDialog(context, method: "card"),
-                              icon: const Icon(Icons.credit_card),
-                              label: const Text("Card"),
-                              style: ElevatedButton.styleFrom(
-                                minimumSize: const Size(0, 50),
-                                backgroundColor: Colors.grey[800],
-                                foregroundColor: Colors.white,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 20),
-              Card(
-                color: const Color(0xFF1A1A1A),
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.card_giftcard, color: Colors.orange, size: 28),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Text("Refer & Earn", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                          ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: Colors.orange,
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: const Text("\$0.50 / friend", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 15),
-                      const Text("Share your code with friends. When they sign up, you both get \$0.50!", style: TextStyle(fontSize: 13, color: Colors.white70)),
-                      const SizedBox(height: 15),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF0F0F0F),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(color: Colors.orange, width: 2),
-                        ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                appState.referralCode.isEmpty ? "Loading..." : appState.referralCode,
-                                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 2, color: Colors.white),
-                              ),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.copy, color: Colors.orange),
-                              onPressed: () {
-                                if (appState.referralCode.isNotEmpty) {
-                                  Clipboard.setData(ClipboardData(text: appState.referralCode));
-                                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Referral code copied!")));
-                                }
-                              },
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 15),
-                      Row(
-                        children: [
-                          Expanded(child: _statBox("Friends Invited", "${appState.referralCount}", Colors.orange)),
-                          const SizedBox(width: 10),
-                          Expanded(child: _statBox("Total Earned", "\$${appState.referralEarnings.toStringAsFixed(2)}", const Color(0xFF00FF41))),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 20),
-              Card(
-                child: Column(
-                  children: [
-                    ListTile(
-                      leading: const Icon(Icons.email_outlined, color: Color(0xFF00FF41)),
-                      title: const Text("Email", style: TextStyle(color: Colors.grey)),
-                      subtitle: Text(appState.email, style: const TextStyle(color: Colors.white)),
-                    ),
-                    const Divider(height: 1, color: Colors.grey),
-                    ListTile(
-                      leading: const Icon(Icons.support_agent, color: Color(0xFF00FF41)),
-                      title: const Text("Contact Support", style: TextStyle(color: Colors.grey)),
-                      subtitle: const Text("Chat with us on Telegram", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                      trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: Colors.grey),
-                      onTap: () async {
-                        final Uri telegramUrl = Uri.parse('https://t.me/FBG_Support');
-                        try {
-                          await launchUrl(telegramUrl, mode: LaunchMode.externalApplication);
-                        } catch (e) {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text("Could not open Telegram."), backgroundColor: Colors.red),
-                            );
-                          }
-                        }
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 30),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: () async {
-                    await ApiAuth.clear();
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.clear();
-                    Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginScreen()));
-                  },
-                  icon: const Icon(Icons.logout, color: Colors.red),
-                  label: const Text("Logout", style: TextStyle(color: Colors.red)),
-                  style: OutlinedButton.styleFrom(minimumSize: const Size(0, 50), side: const BorderSide(color: Colors.red)),
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _statBox(String label, String value, Color color) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withValues(alpha: 0.5)),
-      ),
-      child: Column(
-        children: [
-          Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-          const SizedBox(height: 5),
-          Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color)),
-        ],
-      ),
-    );
-  }
-}
-
-// ============== COUNTRY PICKER BOTTOM SHEET ==============
-class CountryPickerSheet extends StatefulWidget {
-  final Map<int, String> countries;
-  final List<String> popularNames;
-  final int? selectedId;
-  final Map<String, double> prices;
-  final Function(int, String) onSelected;
-
-  const CountryPickerSheet({
-    super.key,
-    required this.countries,
-    required this.popularNames,
-    required this.selectedId,
-    required this.prices,
-    required this.onSelected,
-  });
-
-  @override
-  State<CountryPickerSheet> createState() => _CountryPickerSheetState();
-}
-
-class _CountryPickerSheetState extends State<CountryPickerSheet> {
-  final _searchController = TextEditingController();
-  String _query = "";
-
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final popularEntries = <MapEntry<int, String>>[];
-    for (final name in widget.popularNames) {
-      final match = widget.countries.entries.where((e) => e.value == name).firstOrNull;
-      if (match != null) popularEntries.add(match);
-    }
-
-    final filtered = _query.isEmpty
-        ? widget.countries.entries.toList()
-        : widget.countries.entries.where((e) => e.value.toLowerCase().contains(_query.toLowerCase())).toList();
-
-    return DraggableScrollableSheet(
-      initialChildSize: 0.75,
-      minChildSize: 0.5,
-      maxChildSize: 0.95,
-      expand: false,
-      builder: (context, scrollController) {
-        return Column(
-          children: [
-            Container(margin: const EdgeInsets.symmetric(vertical: 12), width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey[600], borderRadius: BorderRadius.circular(2))),
-            const Text("Select Country", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00FF41))),
-            const SizedBox(height: 15),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15),
-              child: TextField(
-                controller: _searchController,
-                onChanged: (value) => setState(() => _query = value),
-                decoration: InputDecoration(
-                  hintText: "Search countries...",
-                  prefixIcon: const Icon(Icons.search),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(30)),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 20),
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Expanded(
-              child: ListView(
-                controller: scrollController,
-                children: [
-                  if (_query.isEmpty && popularEntries.isNotEmpty) ...[
-                    const Padding(padding: EdgeInsets.fromLTRB(20, 10, 20, 5), child: Text("⭐ Popular", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00FF41), fontSize: 14))),
-                    ...popularEntries.map((e) => _buildTile(e.key, e.value)),
-                    const Divider(thickness: 2),
-                    const Padding(padding: EdgeInsets.fromLTRB(20, 10, 20, 5), child: Text("🌍 All Countries", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 14))),
-                  ],
-                  ...filtered.map((e) => _buildTile(e.key, e.value)),
-                  const SizedBox(height: 20),
-                ],
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Widget _buildTile(int id, String name) {
-    final isSelected = widget.selectedId == id;
-    final price = widget.prices[id.toString()];
-    final isOutOfStock = price == null;
-
-    return ListTile(
-      enabled: !isOutOfStock,
-      title: Text(
-        name, 
-        style: TextStyle(
-          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal, 
-          color: isOutOfStock 
-              ? Colors.grey[600] 
-              : (isSelected ? const Color(0xFF00FF41) : Colors.white),
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            balance REAL DEFAULT 0.0,
+            referral_code TEXT UNIQUE,
+            referred_by INTEGER,
+            referral_count INTEGER DEFAULT 0,
+            referral_earnings REAL DEFAULT 0.0,
+            has_topped_up INTEGER DEFAULT 0,
+            is_verified INTEGER DEFAULT 0,
+            verification_code TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-      ),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (isOutOfStock)
-            Text("Out of stock", style: TextStyle(color: Colors.red[300], fontSize: 12))
-          else
-            Text("\$${(price + 0.20).toStringAsFixed(2)}", style: const TextStyle(color: Color(0xFF00FF41), fontWeight: FontWeight.bold, fontSize: 13)),
-          
-          if (isSelected && !isOutOfStock)
-            const Padding(padding: EdgeInsets.only(left: 8), child: Icon(Icons.check, color: Color(0xFF00FF41), size: 20)),
-        ],
-      ),
-      selected: isSelected && !isOutOfStock,
-      onTap: isOutOfStock ? null : () {
-        widget.onSelected(id, name);
-        Navigator.pop(context);
-      },
-    );
-  }
+    """)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN has_topped_up INTEGER DEFAULT 0;")
+    except psycopg2.errors.DuplicateColumn:
+        conn.rollback()
+
+    for _stmt in (
+        "ALTER TABLE users ADD COLUMN verification_code_expires TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN verification_attempts INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN token_invalid_before TIMESTAMP",
+    ):
+        try:
+            cursor.execute(_stmt)
+            conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            activation_id TEXT,
+            phone_number TEXT,
+            service TEXT,
+            country INTEGER,
+            status TEXT DEFAULT 'PENDING',
+            sms_code TEXT,
+            cost REAL DEFAULT 0.50,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            payment_id TEXT UNIQUE,
+            user_id INTEGER NOT NULL,
+            amount REAL,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Paystack Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS paystack_payments (
+            reference TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            amount_ngn INTEGER NOT NULL,
+            credit_usd REAL NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==================== BACKGROUND SWEEPER (8 MINUTES) ====================
+def _sweep_stale_activations():
+    while True:
+        try:
+            time.sleep(60)
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users u
+                SET balance = balance + t.cost
+                FROM transactions t
+                WHERE t.user_id = u.id
+                  AND t.status = 'PENDING'
+                  AND t.service <> 'full'
+                  AND t.sms_code IS NULL
+                  AND t.created_at < NOW() - INTERVAL '8 minutes'
+            """)
+            cursor.execute("""
+                UPDATE transactions
+                SET status = 'CANCELLED'
+                WHERE status = 'PENDING'
+                  AND service <> 'full'
+                  AND sms_code IS NULL
+                  AND created_at < NOW() - INTERVAL '8 minutes'
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            _log.warning("sweep failed: %s", e)
+
+threading.Thread(target=_sweep_stale_activations, daemon=True).start()
+# ===========================================================
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256$%d$%s$%s" % (PBKDF2_ITERATIONS, salt, dk.hex())
+
+def verify_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _algo, iterations, salt, expected = stored.split("$", 3)
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iterations))
+            return hmac.compare_digest(dk.hex(), expected)
+        except Exception:
+            return False
+    legacy = hashlib.sha256(password.encode()).hexdigest()
+    return hmac.compare_digest(legacy, stored)
+
+def needs_rehash(stored: str) -> bool:
+    if not stored or not stored.startswith("pbkdf2_sha256$"):
+        return True
+    try:
+        return int(stored.split("$")[1]) < PBKDF2_ITERATIONS
+    except Exception:
+        return True
+
+def generate_referral_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    suffix = ''.join(random.choices(chars, k=6))
+    return f"FBG-{suffix}"
+
+def make_unique_code(cursor) -> str:
+    for _ in range(20):
+        code = generate_referral_code()
+        cursor.execute("SELECT id FROM users WHERE referral_code = %s", (code,))
+        if not cursor.fetchone():
+            return code
+    raise Exception("Could not generate unique referral code")
+
+def generate_6_digit_code():
+    return ''.join(secrets.choice(string.digits) for _ in range(6))
+
+# ==================== MODELS ====================
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    referral_code: str = ""
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class BuyRequest(BaseModel):
+    user_id: Optional[int] = None
+    service: str
+    country: int
+
+class TopUpRequest(BaseModel):
+    user_id: int
+    amount: float
+
+class EmailRequest(BaseModel):
+    email: str
+
+class VerifyRequest(BaseModel):
+    email: str
+    code: str
+
+class ResetRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+class TopupRequest(BaseModel):
+    amount_ngn: int
+
+# ==================== AUTH & RATE-LIMIT HELPERS ====================
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+def _b64d(text_value: str) -> bytes:
+    return base64.urlsafe_b64decode(text_value + "=" * (-len(text_value) % 4))
+
+def create_access_token(user_id: int) -> str:
+    now = time.time()
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"sub": str(user_id), "iat": round(now, 6), "exp": int(now) + TOKEN_TTL_HOURS * 3600}
+    head = _b64e(json.dumps(header, separators=(",", ":")).encode())
+    body = _b64e(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = ("%s.%s" % (head, body)).encode()
+    sig = hmac.new(_EFFECTIVE_AUTH_SECRET.encode(), signing_input, hashlib.sha256).digest()
+    return "%s.%s.%s" % (head, body, _b64e(sig))
+
+def verify_access_token(token: str) -> Optional[dict]:
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return None
+    head, body, sig = parts
+    signing_input = ("%s.%s" % (head, body)).encode()
+    expected = hmac.new(_EFFECTIVE_AUTH_SECRET.encode(), signing_input, hashlib.sha256).digest()
+    try:
+        if not hmac.compare_digest(expected, _b64d(sig)):
+            return None
+        header = json.loads(_b64d(head))
+        payload = json.loads(_b64d(body))
+    except Exception:
+        return None
+    if not isinstance(header, dict) or header.get("alg") != "HS256":
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        payload["sub"] = int(payload["sub"])
+        payload["exp"] = int(payload["exp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if payload["exp"] < int(time.time()):
+        return None
+    return payload
+
+def bearer_token(request: Request) -> Optional[str]:
+    raw = request.headers.get("authorization", "")
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip() or None
+    return None
+
+def _token_revoked(user_id: int, issued_at: int) -> bool:
+    if not issued_at:
+        return False
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT token_invalid_before FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+    except Exception:
+        return False
+    if not row or row[0] is None or isinstance(row[0], str):
+        return False
+    issued = datetime.fromtimestamp(float(issued_at), timezone.utc).replace(tzinfo=None)
+    return issued < row[0]
+
+def auth_from_request(request: Request):
+    token = bearer_token(request)
+    if not token:
+        return None
+    payload = verify_access_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.", headers={"WWW-Authenticate": "Bearer"})
+    if _token_revoked(payload["sub"], float(payload.get("iat") or 0)):
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.", headers={"WWW-Authenticate": "Bearer"})
+    return payload["sub"]
+
+def require_user(request: Request) -> int:
+    user_id = auth_from_request(request)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required.", headers={"WWW-Authenticate": "Bearer"})
+    return user_id
+
+def resolve_self(request: Request, user_id: int) -> int:
+    token_user = auth_from_request(request)
+    if token_user is not None:
+        if token_user != user_id:
+            raise HTTPException(status_code=403, detail="You can only access your own account.")
+        return token_user
+    if AUTH_MODE == "strict":
+        raise HTTPException(status_code=401, detail="Authentication required.", headers={"WWW-Authenticate": "Bearer"})
+    _log.warning("AUTH_MODE=compat: anonymous access to user %s (ip=%s)", user_id, _client_ip(request))
+    return user_id
+
+_RATE_LOCK = threading.Lock()
+_RATE_HITS = {}
+_RATE_RULES = {
+    "login": (10, 60),
+    "register": (5, 300),
+    "forgot": (5, 300),
+    "request_code": (5, 300),
+    "verify": (10, 300),
+    "reset": (10, 300),
 }
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def rate_limit(request: Request, bucket: str) -> None:
+    if not RATE_LIMIT_ENABLED:
+        return
+    limit, window = _RATE_RULES.get(bucket, (30, 60))
+    key = (bucket, _client_ip(request))
+    now = time.time()
+    with _RATE_LOCK:
+        hits = [t for t in _RATE_HITS.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            retry_after = max(1, int(window - (now - hits[0])) + 1)
+            raise HTTPException(status_code=429, detail="Too many requests. Please slow down and try again shortly.", headers={"Retry-After": str(retry_after)})
+        hits.append(now)
+        _RATE_HITS[key] = hits
+        if len(_RATE_HITS) > 5000:
+            for stale in [k for k, v in _RATE_HITS.items() if not v or now - v[-1] > 3600]:
+                _RATE_HITS.pop(stale, None)
+
+def _code_expired(expires) -> bool:
+    if expires is None or isinstance(expires, str):
+        return False
+    return _utcnow() > expires
+
+def _generic_messages() -> bool:
+    return AUTH_GENERIC_RESPONSES
+
+# ==================== EMAIL & AUTH ENDPOINTS ====================
+@app.post("/api/auth/request-code")
+def request_code(request: EmailRequest, http_request: Request):
+    rate_limit(http_request, "request_code")
+    email = request.email.strip().lower()
+    code = generate_6_digit_code()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+    exists = cursor.fetchone()
+
+    if not exists:
+        conn.close()
+        if _generic_messages():
+            return {"message": "If that email is registered, a verification code has been sent."}
+        raise HTTPException(status_code=404, detail="Email not found.")
+
+    cursor.execute(
+        "UPDATE users SET verification_code = %s, verification_code_expires = %s, verification_attempts = 0 WHERE email = %s",
+        (code, _utcnow() + timedelta(minutes=RESET_CODE_TTL_MINUTES), email),
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        resend.Emails.send({
+            "from": "noreply@fbgsmsactivate.com",
+            "to": email,
+            "subject": "Your FBG SMS Verification Code",
+            "html": f"<p>Your verification code is: <strong>{code}</strong></p><p>If you didn't request this, ignore this email.</p>"
+        })
+    except Exception as e:
+        _log.error("request-code: resend failed for %s: %s", email, e)
+        raise HTTPException(status_code=502, detail="Could not send the email right now. Please try again in a moment.")
+
+    return {"message": "Verification code sent to your email."}
+
+@app.post("/api/auth/verify-code")
+def verify_code(request: VerifyRequest, http_request: Request):
+    rate_limit(http_request, "verify")
+    email = request.email.strip().lower()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, verification_code, verification_code_expires, verification_attempts FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    user_id, stored_code, expires, attempts = user[0], user[1], user[2], (user[3] or 0)
+
+    if not stored_code:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No active verification code. Please request a new one.")
+    if _code_expired(expires):
+        cursor.execute("UPDATE users SET verification_code = NULL, verification_code_expires = NULL, verification_attempts = 0 WHERE id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=400, detail="This code has expired. Please request a new one.")
+    if attempts >= RESET_MAX_ATTEMPTS:
+        conn.close()
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts. Please request a new code.")
+    if not hmac.compare_digest(str(stored_code), str(request.code).strip()):
+        cursor.execute("UPDATE users SET verification_attempts = %s WHERE id = %s", (attempts + 1, user_id))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+
+    cursor.execute("UPDATE users SET is_verified = 1, verification_code = NULL, verification_code_expires = NULL, verification_attempts = 0 WHERE id = %s", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Account verified successfully!", "user_id": user_id}
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(request: EmailRequest, http_request: Request):
+    rate_limit(http_request, "forgot")
+    email = request.email.strip().lower()
+    code = generate_6_digit_code()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+    exists = cursor.fetchone()
+
+    if not exists:
+        conn.close()
+        if _generic_messages():
+            return {"message": "If that email is registered, a reset code has been sent."}
+        raise HTTPException(status_code=404, detail="Email not found.")
+
+    cursor.execute(
+        "UPDATE users SET verification_code = %s, verification_code_expires = %s, verification_attempts = 0 WHERE email = %s",
+        (code, _utcnow() + timedelta(minutes=RESET_CODE_TTL_MINUTES), email),
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        resend.Emails.send({
+            "from": "noreply@fbgsmsactivate.com",
+            "to": email,
+            "subject": "FBG SMS Password Reset",
+            "html": f"<p>Your password reset code is: <strong>{code}</strong></p><p>This code expires in {RESET_CODE_TTL_MINUTES} minutes.</p>"
+        })
+    except Exception as e:
+        _log.error("forgot-password: resend failed for %s: %s", email, e)
+
+    return {"message": "If that email is registered, a reset code has been sent."}
+
+@app.post("/api/auth/reset-password")
+def reset_password(request: ResetRequest, http_request: Request):
+    rate_limit(http_request, "reset")
+    email = request.email.strip().lower()
+
+    if not request.new_password or len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    if len(request.new_password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="Password is too long.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, verification_code, verification_code_expires, verification_attempts FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+
+    if not user:
+        conn.close()
+        if _generic_messages():
+            raise HTTPException(status_code=400, detail="Invalid or expired reset code.")
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    user_id, stored_code, expires, attempts = user[0], user[1], user[2], (user[3] or 0)
+
+    if not stored_code:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No reset code requested. Please request a new one.")
+    if _code_expired(expires):
+        cursor.execute("UPDATE users SET verification_code = NULL, verification_code_expires = NULL, verification_attempts = 0 WHERE id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=400, detail="This reset code has expired. Please request a new one.")
+    if attempts >= RESET_MAX_ATTEMPTS:
+        conn.close()
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts. Please request a new code.")
+    if not hmac.compare_digest(str(stored_code), str(request.code).strip()):
+        cursor.execute("UPDATE users SET verification_attempts = %s WHERE id = %s", (attempts + 1, user_id))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid reset code.")
+
+    cursor.execute(
+        "UPDATE users SET password_hash = %s, verification_code = NULL, verification_code_expires = NULL, verification_attempts = 0, token_invalid_before = %s WHERE id = %s",
+        (hash_password(request.new_password), _utcnow(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Password reset successful! Please log in."}
+
+# ==================== USER ENDPOINTS ====================
+@app.post("/api/register")
+def register(request: RegisterRequest, http_request: Request):
+    rate_limit(http_request, "register")
+    email = request.email.strip().lower()
+    password = request.password
+    if not email or "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="Password is too long.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+    if cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="This email is already registered. Try logging in.")
+
+    referrer_id = None
+    entered_code = (request.referral_code or "").strip().upper()
+    if entered_code:
+        cursor.execute("SELECT id, referral_count, has_topped_up FROM users WHERE referral_code = %s", (entered_code,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid referral code.")
+
+        referrer_id = row[0]
+        referrer_count = row[1]
+        referrer_topped_up = row[2]
+
+        if referrer_count >= MAX_REFERRALS:
+            conn.close()
+            raise HTTPException(status_code=400, detail="This referral code has reached its maximum limit of 8 referrals.")
+        if referrer_count >= FREE_REFERRAL_LIMIT and not referrer_topped_up:
+            conn.close()
+            raise HTTPException(status_code=400, detail="This user needs to top up their account before they can refer more people.")
+
+    new_code = make_unique_code(cursor)
+    start_balance = REFERRAL_BONUS if referrer_id else STARTING_BALANCE
+
+    cursor.execute(
+        "INSERT INTO users (email, password_hash, balance, referral_code, referred_by, is_verified) VALUES (%s, %s, %s, %s, %s, 0) RETURNING id",
+        (email, hash_password(password), start_balance, new_code, referrer_id)
+    )
+    new_user_id = cursor.fetchone()[0]
+
+    if referrer_id:
+        cursor.execute("UPDATE users SET balance = balance + %s, referral_count = referral_count + 1, referral_earnings = referral_earnings + %s WHERE id = %s", (REFERRAL_BONUS, REFERRAL_BONUS, referrer_id))
+
+    conn.commit()
+    conn.close()
+    return {
+        "user_id": new_user_id,
+        "email": email,
+        "balance": start_balance,
+        "referral_code": new_code,
+        "is_verified": False,
+        "access_token": create_access_token(new_user_id),
+        "token_type": "bearer",
+        "expires_in": TOKEN_TTL_HOURS * 3600,
+    }
+
+@app.post("/api/login")
+def login(request: LoginRequest, http_request: Request):
+    rate_limit(http_request, "login")
+    email = request.email.strip().lower()
+    if not request.password or len(request.password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="Invalid email or password.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, balance, referral_code, is_verified, password_hash FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+
+    if not user:
+        verify_password(request.password, "0" * 64)
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    user_id, balance, referral_code, is_verified, stored_hash = user[0], user[1], user[2], user[3], user[4]
+
+    if not verify_password(request.password, stored_hash or ""):
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if needs_rehash(stored_hash or ""):
+        try:
+            cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(request.password), user_id))
+        except Exception:
+            conn.rollback()
+        conn.commit()
+
+    conn.close()
+    return {
+        "user_id": user_id,
+        "email": email,
+        "balance": balance,
+        "referral_code": referral_code,
+        "is_verified": bool(is_verified),
+        "access_token": create_access_token(user_id),
+        "token_type": "bearer",
+        "expires_in": TOKEN_TTL_HOURS * 3600,
+    }
+
+def _profile_payload(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, email, balance, referral_code, referral_count, referral_earnings FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    if not user:
+        return None
+    return {"user_id": user[0], "email": user[1], "balance": user[2], "referral_code": user[3] or "", "referral_count": user[4] or 0, "referral_earnings": user[5] or 0.0}
+
+def _referral_payload(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT referral_code, referral_count, referral_earnings FROM users WHERE id = %s", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"referral_code": row[0] or "", "referral_count": row[1] or 0, "referral_earnings": row[2] or 0.0, "bonus_per_referral": REFERRAL_BONUS}
+
+@app.get("/api/user/{user_id}")
+def get_user(user_id: int, http_request: Request):
+    resolve_self(http_request, user_id)
+    payload = _profile_payload(user_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return payload
+
+@app.get("/api/referral/{user_id}")
+def get_referral_info(user_id: int, http_request: Request):
+    resolve_self(http_request, user_id)
+    payload = _referral_payload(user_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return payload
+
+@app.get("/api/me")
+def get_me(http_request: Request):
+    payload = _profile_payload(require_user(http_request))
+    if payload is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return payload
+
+@app.get("/api/me/referral")
+def get_me_referral(http_request: Request):
+    payload = _referral_payload(require_user(http_request))
+    if payload is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return payload
+
+# ==================== PAYMENT ENDPOINTS (NOWPayments & Apirone) ====================
+@app.post("/api/payment/create-invoice")
+async def create_invoice(request: TopUpRequest, http_request: Request):
+    resolve_self(http_request, request.user_id)
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    if request.amount < 1.0:
+        raise HTTPException(status_code=400, detail="Minimum top up is $1.00")
+
+    try:
+        order_id = f"user_{request.user_id}_{int(random.random() * 1000000)}"
+        headers = {"x-api-key": NP_API_KEY, "Content-Type": "application/json"}
+        payload = {
+            "price_amount": request.amount,
+            "price_currency": "usd",
+            "order_id": order_id,
+            "order_description": f"FBG SMS Wallet Top-Up for User {request.user_id}",
+            "ipn_callback_url": "https://grizzly-sms-backend.onrender.com/api/payment/webhook",
+            "success_url": "https://fbgsmsactivate.com/",
+            "cancel_url": "https://fbgsmsactivate.com/"
+        }
+        
+        response = requests.post("https://api.nowpayments.io/v1/invoice", json=payload, headers=headers, timeout=20)
+        response.raise_for_status()
+        invoice_data = response.json()
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO payments (payment_id, user_id, amount, status) VALUES (%s, %s, %s, %s)", (str(invoice_data['id']), request.user_id, request.amount, 'waiting'))
+        conn.commit()
+        conn.close()
+        return {"invoice_url": invoice_data['invoice_url']}
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Payment provider timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Payment provider error: {str(e)}")
+
+COINS = [
+    {"code": "btc", "cb": "BTC", "name": "Bitcoin", "symbol": "BTC", "price_id": "bitcoin", "decimals": 8},
+    {"code": "eth", "cb": "ETH", "name": "Ethereum", "symbol": "ETH", "price_id": "ethereum", "decimals": 18},
+    {"code": "usdt@trx", "name": "Tether (TRC20)", "symbol": "USDT", "price_id": None, "decimals": 6},
+    {"code": "usdc@trx", "name": "USD Coin (TRC20)", "symbol": "USDC", "price_id": None, "decimals": 6},
+    {"code": "usdt@eth", "name": "Tether (ERC20)", "symbol": "USDT", "price_id": None, "decimals": 6},
+    {"code": "usdc@eth", "name": "USD Coin (ERC20)", "symbol": "USDC", "price_id": None, "decimals": 6},
+    {"code": "usdt@bnb", "name": "Tether (BEP20)", "symbol": "USDT", "price_id": None, "decimals": 18},
+    {"code": "usdc@bnb", "name": "USD Coin (BEP20)", "symbol": "USDC", "price_id": None, "decimals": 18},
+    {"code": "usdt@ton", "name": "Tether (TON)", "symbol": "USDT", "price_id": None, "decimals": 6},
+    {"code": "ltc", "cb": "LTC", "name": "Litecoin", "symbol": "LTC", "price_id": "litecoin", "decimals": 8},
+    {"code": "bch", "cb": "BCH", "name": "Bitcoin Cash", "symbol": "BCH", "price_id": "bitcoin-cash", "decimals": 8},
+    {"code": "doge", "cb": "DOGE", "name": "Dogecoin", "symbol": "DOGE", "price_id": "dogecoin", "decimals": 8},
+    {"code": "trx", "cb": "TRX", "name": "TRON", "symbol": "TRX", "price_id": "tron", "decimals": 6},
+    {"code": "bnb", "cb": "BNB", "name": "BNB", "symbol": "BNB", "price_id": "binancecoin", "decimals": 18},
+]
+COIN_BY_CODE = {c["code"]: c for c in COINS}
+DUST_MIN_UNITS = 1000
+_price_cache = {}
+
+def _price_from_coinbase(symbol: str) -> float:
+    try:
+        r = requests.get(f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot", timeout=10)
+        if r.status_code == 200:
+            return float(r.json()["data"]["amount"])
+    except Exception:
+        pass
+    return 0.0
+
+def _price_from_coingecko(price_id: str) -> float:
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": price_id, "vs_currencies": "usd"}, timeout=12)
+        if r.status_code == 200:
+            payload = r.json()
+            if price_id in payload:
+                return float(payload[price_id]["usd"])
+    except Exception:
+        pass
+    return 0.0
+
+def get_asset_price_usd(code: str) -> float:
+    coin = COIN_BY_CODE.get(code)
+    if coin is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported currency: {code}")
+    if coin["price_id"] is None:
+        return 1.0
+
+    now = time.time()
+    cached = _price_cache.get(code)
+    if cached and (now - cached[1]) < 300:
+        return cached[0]
+
+    price = _price_from_coinbase(coin.get("cb", ""))
+    if price <= 0:
+        price = _price_from_coingecko(coin["price_id"])
+
+    if price <= 0:
+        raise HTTPException(status_code=503, detail=f"Could not fetch the {code.upper()}/USD rate. Try again shortly.")
+
+    _price_cache[code] = (price, now)
+    return price
+
+def apirone_account_ready() -> bool:
+    return bool(APIRONE_ACCOUNT) and APIRONE_ACCOUNT.startswith(("apr-", "btc-"))
+
+def to_base_units(amount_usd: float, price_usd: float, decimals: int) -> int:
+    units = (Decimal(str(amount_usd)) / Decimal(str(price_usd)) * (Decimal(10) ** decimals)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(units)
+
+@app.get("/api/payment/coins")
+def list_coins():
+    return {"coins": [{"code": c["code"], "name": c["name"], "symbol": c["symbol"], "min_usd": 1.0} for c in COINS]}
+
+class CryptoTopUpRequest(BaseModel):
+    user_id: int
+    amount: float
+    currency: str = "btc"
+
+@app.post("/api/payment/create-btc-invoice")
+async def create_btc_invoice(request: CryptoTopUpRequest, http_request: Request):
+    resolve_self(http_request, request.user_id)
+    currency = (request.currency or "btc").strip().lower()
+
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive.")
+    if request.amount < 1.0:
+        raise HTTPException(status_code=400, detail="Minimum is $1.00")
+    if currency not in COIN_BY_CODE:
+        raise HTTPException(status_code=400, detail=f"Unsupported currency: {currency}")
+    if not apirone_account_ready():
+        raise HTTPException(status_code=503, detail="Crypto payments are not configured yet (APIRONE_ACCOUNT missing on the server).")
+
+    coin = COIN_BY_CODE[currency]
+    price_usd = get_asset_price_usd(currency)
+    units = to_base_units(request.amount, price_usd, coin["decimals"])
+
+    if coin["code"] in ("btc", "ltc", "bch", "doge") and units < DUST_MIN_UNITS:
+        units = DUST_MIN_UNITS
+    if units <= 0:
+        raise HTTPException(status_code=400, detail="Amount too small.")
+
+    url = f"https://apirone.com/api/v2/accounts/{APIRONE_ACCOUNT}/invoices"
+    payload = {
+        "amount": units,
+        "currency": currency,
+        "lifetime": 3600,
+        "callback_url": APIRONE_WEBHOOK_URL,
+        "user-data": {
+            "title": f"FBG SMS top-up ${request.amount:.2f}",
+            "merchant": "FBG SMS",
+            "user_id": str(request.user_id),
+        },
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Payment provider timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Apirone unreachable: {e}")
+
+    if response.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Apirone error {response.status_code}: {response.text[:300]}")
+
+    invoice_data = response.json()
+    invoice_id = invoice_data.get("invoice")
+    invoice_url = invoice_data.get("invoice-url") or invoice_data.get("invoice_url")
+    address = invoice_data.get("address")
+
+    if not invoice_id or not invoice_url:
+        raise HTTPException(status_code=502, detail="Apirone returned an incomplete invoice.")
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO payments (payment_id, user_id, amount, status) VALUES (%s, %s, %s, %s)", (invoice_id, request.user_id, request.amount, "waiting"))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"WARN: could not record apirone payment {invoice_id}: {e}")
+
+    return {
+        "provider": "apirone",
+        "currency": currency,
+        "invoice_url": invoice_url,
+        "invoice": invoice_id,
+        "address": address,
+        "amount_crypto": units / (10 ** coin["decimals"]),
+        "amount_units": units,
+        "asset_price_usd": price_usd,
+    }
+
+@app.post("/api/payment/apirone-webhook")
+async def apirone_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return PlainTextResponse("bad request", status_code=400)
+
+    invoice_id = payload.get("invoice")
+    if not invoice_id:
+        return PlainTextResponse("ok")
+
+    try:
+        r = requests.get(f"https://apirone.com/api/v2/invoices/{invoice_id}", timeout=20)
+        if r.status_code != 200:
+            return PlainTextResponse("ok")
+        info = r.json()
+    except Exception:
+        return PlainTextResponse("retry", status_code=500)
+
+    status = info.get("status")
+    ok_statuses = {"completed"} if APIRONE_REQUIRE_CONFIRMATION else {"paid", "overpaid", "completed"}
+    if status not in ok_statuses:
+        return PlainTextResponse("ok")
+
+    user_id = None
+    amount_usd = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, amount, status FROM payments WHERE payment_id = %s", (invoice_id,))
+        row = cursor.fetchone()
+        if row:
+            user_id, amount_usd, db_status = row
+            if db_status == "finished":
+                conn.close()
+                return PlainTextResponse("ok")
+
+        if user_id is None:
+            raw = info.get("user-data", {}).get("user_id")
+            try:
+                user_id = int(raw)
+            except (TypeError, ValueError):
+                user_id = None
+
+        if user_id is None:
+            conn.close()
+            return PlainTextResponse("ok")
+
+        if amount_usd is None:
+            currency = (info.get("currency") or "btc").lower()
+            coin = COIN_BY_CODE.get(currency)
+            if coin is None:
+                conn.close()
+                return PlainTextResponse("ok")
+            price_usd = get_asset_price_usd(currency)
+            paid_units = Decimal(str(info.get("amount", 0) or 0))
+            amount_usd = float((paid_units / (Decimal(10) ** coin["decimals"])) * Decimal(str(price_usd)))
+            amount_usd = round(amount_usd, 2)
+
+        cursor.execute("UPDATE payments SET status = 'finished' WHERE payment_id = %s", (invoice_id,))
+        cursor.execute("UPDATE users SET balance = balance + %s, has_topped_up = 1 WHERE id = %s", (amount_usd, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"ERROR crediting apirone invoice {invoice_id}: {e}")
+        return PlainTextResponse("retry", status_code=500)
+
+    print(f"Apirone invoice {invoice_id} {status}: credited ${amount_usd} to user {user_id}")
+    return PlainTextResponse("ok")
+
+@app.post("/api/payment/webhook")
+async def payment_webhook(request: Request):
+    payload = await request.json()
+    signature = request.headers.get("x-nowpayments-sig")
+    
+    message = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    expected_sig = hmac.new(NP_IPN_SECRET.encode(), message.encode(), hashlib.sha512).hexdigest()
+    
+    if not signature or not hmac.compare_digest(expected_sig, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    payment_status = payload.get("payment_status")
+    order_id = payload.get("order_id")
+    payment_id = str(payload.get("payment_id"))
+    price_amount = payload.get("price_amount")
+
+    if payment_status in ["finished", "confirmed"]:
+        try:
+            user_id = int(order_id.split("_")[1])
+        except (IndexError, ValueError):
+            return {"status": "error", "message": "Invalid order_id format"}
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM payments WHERE payment_id = %s", (payment_id,))
+        row = cursor.fetchone()
+        
+        if row and row[0] != 'finished':
+            cursor.execute("UPDATE payments SET status = 'finished' WHERE payment_id = %s", (payment_id,))
+            cursor.execute("UPDATE users SET balance = balance + %s, has_topped_up = 1 WHERE id = %s", (price_amount, user_id))
+            conn.commit()
+        conn.close()
+
+    return {"status": "success"}
+
+# ==================== PAYSTACK ENDPOINTS ====================
+def _credit_topup(reference: str, amount_kobo: int, currency: str) -> dict:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, amount_ngn, credit_usd, status FROM paystack_payments WHERE reference = %s", (reference,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "reason": "unknown_reference"}
+    user_id, amount_ngn, credit_usd, status = row
+    if status == "finished":
+        conn.close()
+        return {"ok": True, "already": True}
+    if currency != "NGN":
+        conn.close()
+        return {"ok": False, "reason": "bad_currency"}
+    if int(amount_kobo) != amount_ngn * 100:
+        conn.close()
+        return {"ok": False, "reason": "amount_mismatch"}
+
+    # Atomic claim: only one concurrent request can flip the status.
+    cursor.execute("UPDATE paystack_payments SET status = 'finished' WHERE reference = %s AND status = 'pending'", (reference,))
+    if cursor.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return {"ok": True, "already": True}
+        
+    cursor.execute("UPDATE users SET balance = balance + %s, has_topped_up = 1 WHERE id = %s", (credit_usd, user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "credited": credit_usd}
+
+@app.post("/api/paystack/initialize")
+def paystack_initialize(body: TopupRequest, http_request: Request):
+    if not PAYSTACK_SECRET:
+        raise HTTPException(status_code=503, detail="Payments are not configured yet.")
+    user_id = require_user(http_request)
+    if body.amount_ngn < 500:
+        raise HTTPException(status_code=400, detail="Minimum top-up is 500 NGN.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = %s", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
+    email = row[0]
+
+    reference = f"fbg_{user_id}_{secrets.token_hex(8)}"
+    credit_usd = round(body.amount_ngn / NGN_PER_USD, 2)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO paystack_payments (reference, user_id, amount_ngn, credit_usd) VALUES (%s, %s, %s, %s)",
+        (reference, user_id, body.amount_ngn, credit_usd),
+    )
+    conn.commit()
+    conn.close()
+
+    r = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET}", "Content-Type": "application/json"},
+        json={"email": email, "amount": body.amount_ngn * 100, "reference": reference,
+              "currency": "NGN", "callback_url": "https://grizzly-sms-backend.onrender.com/payment-done"},
+        timeout=25,
+    )
+    data = r.json()
+    if not data.get("status"):
+        raise HTTPException(status_code=502, detail="Could not start payment. Please try again.")
+    return {"authorization_url": data["data"]["authorization_url"], "reference": reference, "credit_usd": credit_usd}
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request):
+    raw = await request.body()
+    sig = request.headers.get("x-paystack-signature", "")
+    if not PAYSTACK_SECRET or not sig:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    expected = hmac.new(PAYSTACK_SECRET.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        event = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad payload")
+    if event.get("event") != "charge.success":
+        return {"status": "ignored"}
+
+    data = event.get("data", {})
+    reference = data.get("reference", "")
+
+    vr = requests.get(
+        f"https://api.paystack.co/transaction/verify/{reference}",
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"},
+        timeout=25,
+    ).json()
+    if not vr.get("status") or vr.get("data", {}).get("status") != "success":
+        return {"status": "not_verified"}
+
+    vd = vr["data"]
+    result = _credit_topup(reference, vd.get("amount", 0), vd.get("currency", ""))
+    _log.warning("paystack webhook ref=%s result=%s", reference, result)
+    return {"status": "ok"}
+
+@app.get("/api/paystack/verify/{reference}")
+def paystack_verify(reference: str, http_request: Request):
+    user_id = require_user(http_request)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM paystack_payments WHERE reference = %s AND user_id = %s", (reference, user_id))
+    row = cursor.fetchone()
+    conn.close()
+    return {"status": row[0] if row else "unknown"}
+
+@app.get("/api/app/version")
+def app_version():
+    return {"versionCode": 2003,
+            "versionName": "1.3.1",
+            "url": "https://github.com/csbgheadoffice00-netizen/fbg-sms-/releases/download/v1.3.1/app-release.apk",
+            "notes": "Bug fixes and faster refunds."}
+
+# ==================== TEMPORARY ADMIN ENDPOINT ====================
+@app.post("/api/admin/add-funds")
+def admin_add_funds(user_id: int, amount: float):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + %s, has_topped_up = 1 WHERE id = %s", (amount, user_id))
+    conn.commit()
+    cursor.execute("SELECT balance FROM users WHERE id = %s", (user_id,))
+    new_bal = cursor.fetchone()
+    conn.close()
+    if not new_bal:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": f"Added ${amount}", "new_balance": new_bal[0]}
+
+# ==================== REFERENCE DATA & NUMBER ENDPOINTS ====================
+@app.get("/api/countries")
+def get_countries():
+    params = {"api_key": API_KEY, "action": "getCountries"}
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=15)
+        return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/services")
+def get_services():
+    params = {"api_key": API_KEY, "action": "getServicesList", "lang": "en"}
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=15)
+        data = response.json()
+        
+        if isinstance(data, dict):
+            data.pop("full", None)
+            if "services" in data and isinstance(data["services"], list):
+                data["services"] = [s for s in data["services"] if s.get("code") != "full"]
+        elif isinstance(data, list):
+            data = [s for s in data if s.get("code") != "full"]
+            
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/prices")
+def get_prices(service: str = None, country: int = None):
+    params = {"api_key": API_KEY, "action": "getPrices"}
+    if service: params["service"] = service
+    if country: params["country"] = country
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=15)
+        return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/buy-number")
+def buy_number(request: BuyRequest, http_request: Request):
+    token_user = auth_from_request(http_request)
+    if token_user is not None:
+        if request.user_id not in (None, 0, token_user):
+            raise HTTPException(status_code=403, detail="You can only buy numbers for your own account.")
+        user_id = token_user
+    else:
+        if AUTH_MODE == "strict":
+            raise HTTPException(status_code=401, detail="Authentication required.", headers={"WWW-Authenticate": "Bearer"})
+        if not request.user_id:
+            raise HTTPException(status_code=400, detail="user_id is required.")
+        user_id = request.user_id
+        _log.warning("AUTH_MODE=compat: anonymous buy-number for user %s", user_id)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if str(getattr(request, "service", "")).strip().lower() == "full":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Full rent is not available yet. Please choose another service.")
+
+    if str(getattr(request, "service", "")).lower() == "fb" and getattr(request, "country", None) == 187:
+        _log.warning("fb_gate OBSERVE: facebook order requested country=187 user=%s", user_id)
+
+    price_params = {"api_key": API_KEY, "action": "getPrices", "service": request.service, "country": request.country}
+    try:
+        price_response = requests.get(BASE_URL, params=price_params, timeout=15)
+        price_data = price_response.json()
+        cost = price_data[str(request.country)][request.service]["cost"]
+        final_price = round(cost + PROFIT_MARGIN, 2)
+    except (KeyError, TypeError):
+        conn.close()
+        raise HTTPException(status_code=400, detail="This service is currently unavailable. Please try another country or service.")
+    except requests.exceptions.Timeout:
+        conn.close()
+        raise HTTPException(status_code=504, detail="HeroSMS server timed out. Please try again.")
+
+    if user[0] < final_price:
+        conn.close()
+        raise HTTPException(status_code=400, detail="INSUFFICIENT_BALANCE")
+
+    params = {"api_key": API_KEY, "action": "getNumber", "service": request.service, "country": request.country}
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=15)
+        if "ACCESS_NUMBER" not in response.text:
+            conn.close()
+            raise HTTPException(status_code=400, detail="HeroSMS is out of stock for this selection. Try another country.")
+    except requests.exceptions.Timeout:
+        conn.close()
+        raise HTTPException(status_code=504, detail="HeroSMS server timed out. Please try again.")
+
+    parts = response.text.split(":")
+    activation_id, phone_number = parts[1], parts[2]
+
+    cursor.execute("UPDATE users SET balance = balance - %s WHERE id = %s", (final_price, user_id))
+    cursor.execute("""INSERT INTO transactions (user_id, activation_id, phone_number, service, country, status, cost) VALUES (%s, %s, %s, %s, %s, 'PENDING', %s)""", (user_id, activation_id, phone_number, request.service, request.country, final_price))
+    conn.commit()
+    conn.close()
+    return {"activation_id": activation_id, "phone_number": phone_number, "price": final_price}
+
+def _activation_owner(http_request: Request, activation_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM transactions WHERE activation_id = %s", (activation_id,))
+    row = cursor.fetchone()
+    conn.close()
+    owner = row[0] if row else None
+
+    token_user = auth_from_request(http_request)
+    if token_user is not None:
+        if owner is not None and owner != token_user:
+            raise HTTPException(status_code=403, detail="This activation belongs to another account.")
+        return owner
+    if AUTH_MODE == "strict":
+        raise HTTPException(status_code=401, detail="Authentication required.", headers={"WWW-Authenticate": "Bearer"})
+    _log.warning("AUTH_MODE=compat: anonymous access to activation %s", activation_id)
+    return owner
+
+def _iso_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+def _settle_cancelled(activation_id: str) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, cost, status, sms_code FROM transactions WHERE activation_id = %s",
+        (activation_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+    owner_id, cost, status, sms_code = row
+    if status in ("CANCELLED", "COMPLETED") or sms_code:
+        conn.close()
+        return False
+    cursor.execute("UPDATE users SET balance = balance + %s WHERE id = %s", (cost, owner_id))
+    cursor.execute(
+        "UPDATE transactions SET status = 'CANCELLED' WHERE activation_id = %s AND status = 'PENDING'",
+        (activation_id,),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+@app.get("/api/check-sms/{activation_id}")
+def check_sms(activation_id: str, http_request: Request):
+    _activation_owner(http_request, activation_id)
+    params = {"api_key": API_KEY, "action": "getStatus", "id": activation_id}
+    response = requests.get(BASE_URL, params=params, timeout=15)
+    text = response.text
+    if "STATUS_OK" in text:
+        code = text.split(":")[1]
+        if code.strip() in ("", "999999", "000000"):
+            return {"status": text, "ignored": True}
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM transactions WHERE activation_id = %s", (activation_id,))
+        row = cursor.fetchone()
+        if row and row[0] not in ('COMPLETED', 'CANCELLED'):
+            cursor.execute("UPDATE transactions SET status = 'COMPLETED', sms_code = %s WHERE activation_id = %s", (code, activation_id))
+            conn.commit()
+            conn.close()
+            requests.get(BASE_URL, params={"api_key": API_KEY, "action": "setStatus", "status": 6, "id": activation_id})
+        else:
+            conn.close()
+    elif "STATUS_CANCEL" in text:
+        _settle_cancelled(activation_id)
+    return {"status": text}
+
+@app.post("/api/cancel/{activation_id}")
+def cancel_activation(activation_id: str, http_request: Request):
+    _activation_owner(http_request, activation_id)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, cost, status, sms_code, created_at FROM transactions WHERE activation_id = %s",
+        (activation_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Activation not found.")
+    owner_id, cost, status, sms_code, created_at = row
+
+    if status == "CANCELLED":
+        conn.close()
+        return {"message": "Activation already cancelled"}
+    if status == "COMPLETED" or sms_code:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="This activation already received an SMS and cannot be refunded.",
+        )
+
+    cursor.execute("UPDATE users SET balance = balance + %s WHERE id = %s", (cost, owner_id))
+    cursor.execute("UPDATE transactions SET status = 'CANCELLED' WHERE activation_id = %s", (activation_id,))
+    conn.commit()
+    conn.close()
+    
+    threading.Thread(
+        target=lambda: requests.get(
+            BASE_URL,
+            params={"api_key": API_KEY, "action": "setStatus", "status": 8, "id": activation_id},
+            timeout=15,
+        ),
+        daemon=True,
+    ).start()
+    
+    return {"message": "Activation cancelled"}
+
+def _active_payload(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT activation_id, phone_number, service, country, created_at
+           FROM transactions
+           WHERE user_id = %s AND status = 'PENDING'
+           ORDER BY created_at DESC""",
+        (user_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return {"has_active": False, "activations": []}
+
+    activations = []
+    for row in rows:
+        activations.append({
+            "activation_id": row[0],
+            "phone_number": row[1],
+            "service": row[2],
+            "country": row[3],
+            "created_at": _iso_utc(row[4]),
+        })
+
+    return {"has_active": True, "activations": activations}
+
+def _history_payload(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, phone_number, service, country, status, sms_code, cost, created_at FROM transactions WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return {"history": [{"id": r[0], "phone_number": r[1], "service": r[2], "country": r[3], "status": r[4], "sms_code": r[5], "cost": r[6], "created_at": _iso_utc(r[7])} for r in rows]}
+
+@app.get("/api/active/{user_id}")
+def get_active(user_id: int, http_request: Request):
+    resolve_self(http_request, user_id)
+    return _active_payload(user_id)
+
+@app.get("/api/history/{user_id}")
+def get_history(user_id: int, http_request: Request):
+    resolve_self(http_request, user_id)
+    return _history_payload(user_id)
+
+@app.get("/api/me/active")
+def get_me_active(http_request: Request):
+    return _active_payload(require_user(http_request))
+
+@app.get("/api/me/history")
+def get_me_history(http_request: Request):
+    return _history_payload(require_user(http_request))
+
+# ==================== PAYMENT DONE PAGE ====================
+@app.get("/payment-done", response_class=HTMLResponse)
+def payment_done():
+    return """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment received</title></head>
+<body style="font-family:system-ui;background:#0f1115;color:#eaeaea;margin:0;
+display:flex;align-items:center;justify-content:center;height:100vh;text-align:center">
+<div><h2>Payment received</h2>
+<p>Your balance updates in the app within a few seconds.</p>
+<p>You can close this page and return to FBG SMS.</p></div>
+</body></html>"""
