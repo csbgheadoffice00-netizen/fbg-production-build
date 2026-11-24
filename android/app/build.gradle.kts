@@ -30,6 +30,12 @@ android {
         versionName = flutter.versionName
     }
 
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     signingConfigs {
         create("release") {
             keyAlias = keystoreProperties["keyAlias"] as String
