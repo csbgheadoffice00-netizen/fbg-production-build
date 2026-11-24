@@ -12,7 +12,7 @@ subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
 }
-subprojects {id("com.android.application") version "9.1.1" apply false
+subprojects {
     project.evaluationDependsOn(":app")
 }
 
